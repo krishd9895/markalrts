@@ -184,27 +184,26 @@ async def generate_ai_variants(stock_name: str) -> dict:
 # =====================================================================
 # TWO-TIER LOCAL FILTERING (ZERO TOKEN WASTE)
 # =====================================================================
-async def execute_two_tier_filter(text: str) -> tuple[bool, str, str]:
+async def execute_two_tier_filter(text: str) -> tuple[bool, str, list[str]]:
     """
     Evaluates incoming raw context payloads against local caches using word-boundary regex.
-    Returns: (is_matched, match_type, matched_entity_name)
+    Returns: (is_matched, match_type, list_of_matched_entity_names)
+    match_type is "Portfolio Stock" if any portfolio stocks are matched, else "Macro Economy" if any macro keywords matched
     """
     if not text:
-        return False, "", ""
+        return False, "", []
     
     normalized_text = text.lower()
     
     # Tier 1: Check Specific Stock Portfolio Rules - Sort by longest positive variant first
-    # This ensures more specific entities (like "NTPC Green Energy Limited) are checked
-    # before more generic ones (like "NTPC LTD")
     stocks = await db["portfolio"].find({}).to_list(length=None)
-    # Sort stocks by the length of their longest positive variant (descending order)
     stocks_sorted = sorted(
         stocks,
         key=lambda s: len(max(s.get("positive_variants", [s.get("stock_name", "")]), key=len)),
         reverse=True
     )
     
+    matched_portfolio = []
     for stock in stocks_sorted:
         positives = stock.get("positive_variants", [])
         exclusions = stock.get("exclusion_variants", [])
@@ -227,20 +226,25 @@ async def execute_two_tier_filter(text: str) -> tuple[bool, str, str]:
                     break
             
             if not has_exclusion:
-                # No exclusions found, this is a valid match!
-                return True, "Portfolio Stock", stock.get("stock_name")
-            # If exclusion found, move on to check next stock in sorted list
-            
+                matched_portfolio.append(stock.get("stock_name"))
+    
+    if matched_portfolio:
+        return True, "Portfolio Stock", matched_portfolio
+    
     # Tier 2: Check Global Macro Economy Keywords (also with word boundaries)
+    matched_macro = []
     macro_doc = await db["config"].find_one({"_id": "macro_settings"})
     if macro_doc:
         keywords = macro_doc.get("macro_keywords", [])
         for kw in keywords:
             kw_pattern = rf"\b{re.escape(kw.lower())}\b"
             if re.search(kw_pattern, normalized_text):
-                return True, "Macro Economy", kw.upper()
+                matched_macro.append(kw.upper())
+    
+    if matched_macro:
+        return True, "Macro Economy", matched_macro
                 
-    return False, "", ""
+    return False, "", []
 
 # =====================================================================
 # INTERACTIVE SETTINGS MECHANICS (UI GENERATOR)
@@ -1046,52 +1050,56 @@ async def is_duplicate_news(text_content: str) -> bool:
         return False
 
 # =====================================================================
-# BATCH BUFFER: groups messages by entity, waits 30s, fires one request
+# BATCH BUFFER: holds unique messages, waits 30s, flushes all at once
 # =====================================================================
 
-# Structure: { entity_name -> {"items": [...], "timer_task": asyncio.Task} }
-# Each item: {"text": str, "deep_link": str, "chat_id": int, "message_id": int}
-_entity_buffers: dict = {}
-_BATCH_WINDOW = 30  # seconds to wait before flushing a buffer
+# Structure: { msg_hash -> {"message": {...}, "entities": list[str], "match_type": str} }
+_message_buffer: dict = {}
+_buffer_timer_task: asyncio.Task = None
+_BATCH_WINDOW = 30  # seconds to wait before flushing buffer
 
 
-async def _flush_entity_buffer(entity: str, match_type: str):
+async def _flush_message_buffer():
     """
-    Called after BATCH_WINDOW seconds of silence for a given entity.
-    FIRST forwards all messages (text and PDF) to owners,
-    THEN attempts Gemini analysis.
-    On Gemini failure: messages were already forwarded, so just log.
+    Called after BATCH_WINDOW seconds of silence.
+    FIRST forwards all unique messages (text and PDF) to owners,
+    THEN attempts Gemini analysis (if applicable).
     """
-    bucket = _entity_buffers.pop(entity, None)
-    if not bucket or not bucket["items"]:
+    global _message_buffer, _buffer_timer_task
+    messages = list(_message_buffer.values())
+    _message_buffer.clear()
+    _buffer_timer_task = None
+    
+    if not messages:
         return
 
-    items = bucket["items"]
-    logger.info(f"[Batch] Flushing {len(items)} message(s) for [{entity}].")
+    logger.info(f"[Batch] Flushing {len(messages)} unique message(s).")
     activity_logger.info(f"="*80)
-    activity_logger.info(f"PROCESSING BATCH FOR ENTITY: {entity} ({match_type})")
-    activity_logger.info(f"Number of messages in batch: {len(items)}")
+    activity_logger.info(f"PROCESSING BATCH OF {len(messages)} UNIQUE MESSAGES")
     activity_logger.info(f"="*80)
     
-    for i, item in enumerate(items, 1):
-        activity_logger.info(f"  [{i}] {item['deep_link']}")
+    for i, msg_bucket in enumerate(messages, 1):
+        item = msg_bucket["message"]
+        entities = msg_bucket["entities"]
+        activity_logger.info(f"  [{i}] {item['deep_link']} | Entities: {', '.join(entities)}")
 
-    # ── FIRST: Forward all messages (text and PDF) to owners ──────────
+    # ── FIRST: Forward all unique messages (text and PDF) to owners ──────────
     activity_logger.info(f"\nSTEP 1: Sending messages to owners first")
     for owner in OWNERS:
         try:
             await bot.send_message(
                 owner,
-                f"📨 **New {match_type} Update**\n"
-                f"Entity: {entity}\n"
-                f"Messages: {len(items)}",
+                f"📨 **New Updates**\n"
+                f"Unique Messages: {len(messages)}",
                 link_preview=False
             )
             
-            for item in items:
+            for msg_bucket in messages:
+                item = msg_bucket["message"]
+                entities = msg_bucket["entities"]
+                match_type = msg_bucket["match_type"]
                 try:
                     # First, try to forward the actual message using the user session
-                    # Get owner entity for user session
                     if not user:
                         raise RuntimeError("User session not configured")
                     owner_entity = await bot.get_entity(owner)
@@ -1103,7 +1111,6 @@ async def _flush_entity_buffer(entity: str, match_type: str):
                 
                 # Fallback if forwarding failed
                 if match_type == "Macro Economy":
-                    # For macro news, just send the link
                     await bot.send_message(
                         owner,
                         f"🌐 Macro News: {item['deep_link']}",
@@ -1111,31 +1118,21 @@ async def _flush_entity_buffer(entity: str, match_type: str):
                     )
                     activity_logger.info(f"  ✓ Macro news link sent to {owner}")
                 else:
-                    # For portfolio news, send full content including PDF
                     if item.get("has_pdf"):
                         try:
                             if not user:
                                 raise RuntimeError("User session not configured")
                             activity_logger.info(f"  Processing PDF from message {item['message_id']}...")
-                            # Get the original message object
                             original_message = await user.get_messages(item['chat_id'], ids=item['message_id'])
-                            
-                            # Extract the proper filename
-                            pdf_filename = extract_real_filename(original_message, entity)
-                            
-                            # Download and send via bot (most reliable method)
-                            logger.debug(f"[PDF SEND] About to download media!")
+                            pdf_filename = extract_real_filename(original_message, entities[0])
                             pdf_file = await user.download_media(original_message, file=bytes)
-                            logger.debug(f"[PDF SEND] Downloaded file is None? {pdf_file is None}")
                             if pdf_file:
-                                # Wrap bytes in BytesIO and set .name attribute for proper filename
                                 pdf_bytesio = io.BytesIO(pdf_file)
                                 pdf_bytesio.name = pdf_filename
-                                logger.debug(f"[PDF SEND] Calling bot.send_file with BytesIO object, name: {pdf_bytesio.name}")
                                 await bot.send_file(
                                     owner,
                                     pdf_bytesio,
-                                    caption=f"PDF about {entity}\nSource: {item['deep_link']}"
+                                    caption=f"PDF about {', '.join(entities)}\nSource: {item['deep_link']}"
                                 )
                                 activity_logger.info(f"  ✓ PDF sent to {owner} with filename: {pdf_filename}")
                             else:
@@ -1156,100 +1153,92 @@ async def _flush_entity_buffer(entity: str, match_type: str):
                             link_preview=False
                         )
                         activity_logger.info(f"  ✓ Text sent to {owner}")
-                    
+                
         except Exception as e:
             logger.error(f"Failed to send messages to {owner}: {e}")
             activity_logger.error(f"  ✗ Failed to send to {owner}: {e}")
 
-    # ── Build combined prompt for AI (only for portfolio news with settings enabled) ──────────
+    # ── AI Analysis: group messages by first matched entity (for now) or process individually? Let's process portfolio messages together ──────────
+    portfolio_messages = [m for m in messages if m["match_type"] == "Portfolio Stock"]
     config = await get_system_config()
-    # Skip AI analysis for macro news
-    if match_type == "Macro Economy":
-        activity_logger.info("Skipping AI analysis for macro news.")
-        return
-    # Skip AI analysis if pdf_analysis_mode is off and there are only PDFs
-    has_only_pdfs = all(not item.get("text") and item.get("has_pdf") for item in items)
-    if has_only_pdfs and not config.get("pdf_analysis_mode", False):
-        activity_logger.info("Skipping AI analysis: PDF-only messages and PDF analysis mode is off.")
-        return
-        
-    combined_messages = ""
-    all_links = []
-    for i, item in enumerate(items, 1):
-        if item.get("text"):
-            combined_messages += f"--- MESSAGE {i} ---\n{item['text']}\nSOURCE: {item['deep_link']}\n\n"
-        all_links.append(item["deep_link"])
-
-    # If all messages were PDF-only with no text and pdf_analysis_mode is still off, nothing to analyse
-    if not combined_messages.strip() and not config.get("pdf_analysis_mode", False):
-        activity_logger.info("No text content to analyse and PDF analysis mode is off, skipping AI.")
-        return
-
-    primary_link = all_links[0]
-    all_links_str = "\n".join(f"{i+1}. {l}" for i, l in enumerate(all_links))
-
-    user_prompt = (
-        f"The following {len(items)} message(s) were received about [{entity}] within a short window.\n"
-        f"Analyse them collectively as one intelligence report.\n\n"
-        f"{combined_messages}"
-        f"ALL SOURCE LINKS:\n{all_links_str}\n\n"
-        f"TELEGRAM_LINK_REFERENCE: {primary_link}"
-    )
     
-    activity_logger.info(f"\nSTEP 2: Sending to AI for analysis")
-    try:
-        raw_analysis = await ai_manager.generate_content(
-            prompt=user_prompt,
-            system_instruction=config.get("system_prompt", ANALYSIS_SYSTEM_PROMPT)
-        )
-        final_output = raw_analysis.replace("{{telegram_link}}", primary_link)
+    if portfolio_messages:
+        # Skip AI analysis if pdf_analysis_mode is off and there are only PDFs
+        has_only_pdfs = all(not m["message"].get("text") and m["message"].get("has_pdf") for m in portfolio_messages)
+        if has_only_pdfs and not config.get("pdf_analysis_mode", False):
+            activity_logger.info("Skipping AI analysis: PDF-only messages and PDF analysis mode is off.")
+        else:
+            combined_messages = ""
+            all_links = []
+            for i, msg_bucket in enumerate(portfolio_messages, 1):
+                item = msg_bucket["message"]
+                entities = msg_bucket["entities"]
+                if item.get("text"):
+                    combined_messages += f"--- MESSAGE {i} (Entities: {', '.join(entities)}) ---\n{item['text']}\nSOURCE: {item['deep_link']}\n\n"
+                all_links.append(item["deep_link"])
 
-        await db["news_logs"].insert_one({
-            "timestamp": datetime.now(IST),
-            "batch_size": len(items),
-            "deep_link": primary_link,
-            "all_links": all_links,
-            "raw_text": combined_messages,
-            "matched_entity": entity,
-            "match_type": match_type,
-            "analysis_output": final_output
-        })
-        
-        activity_logger.info(f"  ✓ AI analysis SUCCESSFUL")
+            if combined_messages.strip() or config.get("pdf_analysis_mode", False):
+                primary_link = all_links[0]
+                all_links_str = "\n".join(f"{i+1}. {l}" for i, l in enumerate(all_links))
 
-        for owner in OWNERS:
-            try:
-                await bot.send_message(owner, final_output, link_preview=False)
-                activity_logger.info(f"  ✓ Sent AI analysis to {owner}")
-            except Exception as e:
-                logger.error(f"Broadcast failed to {owner}: {e}")
-                activity_logger.error(f"  ✗ Failed to send AI analysis to {owner}: {e}")
+                user_prompt = (
+                    f"The following {len(portfolio_messages)} portfolio message(s) were received within a short window.\n"
+                    f"Analyse them collectively as one intelligence report.\n\n"
+                    f"{combined_messages}"
+                    f"ALL SOURCE LINKS:\n{all_links_str}\n\n"
+                    f"TELEGRAM_LINK_REFERENCE: {primary_link}"
+                )
+                
+                activity_logger.info(f"\nSTEP 2: Sending portfolio messages to AI for analysis")
+                try:
+                    raw_analysis = await ai_manager.generate_content(
+                        prompt=user_prompt,
+                        system_instruction=config.get("system_prompt", ANALYSIS_SYSTEM_PROMPT)
+                    )
+                    final_output = raw_analysis.replace("{{telegram_link}}", primary_link)
 
-    except Exception as e:
-        logger.error(f"[Batch] Gemini call failed for [{entity}]: {e}")
-        activity_logger.error(f"  ✗ AI analysis FAILED: {e}")
-        activity_logger.info(f"  (Messages were already forwarded earlier)")
+                    await db["news_logs"].insert_one({
+                        "timestamp": datetime.now(IST),
+                        "batch_size": len(portfolio_messages),
+                        "deep_link": primary_link,
+                        "all_links": all_links,
+                        "raw_text": combined_messages,
+                        "matched_entities": [m["entities"] for m in portfolio_messages],
+                        "match_type": "Portfolio Stock",
+                        "analysis_output": final_output
+                    })
+                    
+                    activity_logger.info(f"  ✓ AI analysis SUCCESSFUL")
+
+                    for owner in OWNERS:
+                        try:
+                            await bot.send_message(owner, final_output, link_preview=False)
+                            activity_logger.info(f"  ✓ Sent AI analysis to {owner}")
+                        except Exception as e:
+                            logger.error(f"Broadcast failed to {owner}: {e}")
+                            activity_logger.error(f"  ✗ Failed to send AI analysis to {owner}: {e}")
+
+                except Exception as e:
+                    logger.error(f"[Batch] Gemini call failed: {e}")
+                    activity_logger.error(f"  ✗ AI analysis FAILED: {e}")
+                    activity_logger.info(f"  (Messages were already forwarded earlier)")
 
 
-def _schedule_flush(entity: str, match_type: str):
+def _schedule_buffer_flush():
     """
-    (Re)starts the 30-second countdown for a given entity.
+    (Re)starts the 30-second countdown for buffer flush.
     If a timer is already running, cancel it and start fresh —
     this means the window extends each time a new message arrives.
     """
-    existing = _entity_buffers.get(entity, {}).get("timer_task")
-    if existing and not existing.done():
-        existing.cancel()
+    global _buffer_timer_task
+    if _buffer_timer_task and not _buffer_timer_task.done():
+        _buffer_timer_task.cancel()
 
     async def _delayed_flush():
         await asyncio.sleep(_BATCH_WINDOW)
-        await _flush_entity_buffer(entity, match_type)
+        await _flush_message_buffer()
 
-    task = asyncio.ensure_future(_delayed_flush())
-    if entity not in _entity_buffers:
-        _entity_buffers[entity] = {"items": [], "timer_task": task}
-    else:
-        _entity_buffers[entity]["timer_task"] = task
+    _buffer_timer_task = asyncio.ensure_future(_delayed_flush())
 
 
 # =====================================================================
@@ -1320,14 +1309,14 @@ async def incoming_stream_pipeline(event: events.NewMessage.Event):
             return
 
         # Local keyword filter
-        is_matched, match_type, entity = await execute_two_tier_filter(text_content)
+        is_matched, match_type, entities = await execute_two_tier_filter(text_content)
         
         if not is_matched:
             channel_logger.info(f"[FILTERED] No match - Not in portfolio or macro keywords")
             return
 
-        logger.info(f"[Filter Hit] {match_type} — {entity}. Buffering for batch.")
-        channel_logger.info(f"[MATCHED] {match_type} - Entity: {entity}")
+        logger.info(f"[Filter Hit] {match_type} — {', '.join(entities)}. Buffering for batch.")
+        channel_logger.info(f"[MATCHED] {match_type} - Entities: {', '.join(entities)}")
 
         # If text is empty and no PDF, nothing useful to buffer
         if not text_content and not has_pdf:
@@ -1335,29 +1324,41 @@ async def incoming_stream_pipeline(event: events.NewMessage.Event):
             return
 
         # Exact-hash dedup on text (zero-token gate) — skip for PDF-only messages
+        msg_hash = None
         if text_content:
             normalised = _normalise(text_content)
             msg_hash = hashlib.sha256(normalised.encode()).hexdigest()
+        else:
+            # For PDF-only, create hash from file ID if available, or just skip dedup for now
+            if event.document and event.document.file_id:
+                msg_hash = hashlib.sha256(event.document.file_id.encode()).hexdigest()
+        
+        if msg_hash:
+            if msg_hash in _message_buffer:
+                logger.info(f"[Dedup-Gate1] Duplicate already in buffer. Dropping.")
+                channel_logger.info(f"[FILTERED] Duplicate message in buffer (hash: {msg_hash[:16]}...)")
+                return
             if await db["recent_news_hashes"].find_one({"_id": msg_hash}):
-                logger.info(f"[Dedup-Gate1] Duplicate fingerprint. Dropping.")
+                logger.info(f"[Dedup-Gate1] Duplicate fingerprint in DB. Dropping.")
                 channel_logger.info(f"[FILTERED] Duplicate message (hash: {msg_hash[:16]}...)")
                 return
             await db["recent_news_hashes"].insert_one({"_id": msg_hash, "ts": datetime.now(IST)})
 
-        # Add to entity buffer and (re)start the flush timer
-        if entity not in _entity_buffers:
-            _entity_buffers[entity] = {"items": [], "timer_task": None}
+        # Add to message buffer and (re)start the flush timer
+        _message_buffer[msg_hash or str(event.id)] = {
+            "message": {
+                "text": text_content,
+                "deep_link": deep_link,
+                "chat_id": event.chat_id,
+                "message_id": event.id,
+                "has_pdf": has_pdf,
+            },
+            "entities": entities,
+            "match_type": match_type
+        }
 
-        _entity_buffers[entity]["items"].append({
-            "text": text_content,
-            "deep_link": deep_link,
-            "chat_id": event.chat_id,
-            "message_id": event.id,
-            "has_pdf": has_pdf,
-        })
-
-        logger.info(f"[Batch] Buffer for [{entity}] now has {len(_entity_buffers[entity]['items'])} message(s). Timer reset to {_BATCH_WINDOW}s.")
-        _schedule_flush(entity, match_type)
+        logger.info(f"[Batch] Message buffer now has {len(_message_buffer)} unique message(s). Timer reset to {_BATCH_WINDOW}s.")
+        _schedule_buffer_flush()
 
 # =====================================================================
 # STARTUP CHECK: SCAN CHANNELS FOR OLD PORTFOLIO MESSAGES IF NO RECENT NEWS
@@ -1401,8 +1402,8 @@ async def scan_channels_for_last_24h_portfolio_messages():
         activity_logger.info("No monitored channels to scan.")
         return
     
-    # Collect messages to forward
-    messages_to_forward = []
+    # Collect unique messages to forward (key: msg_hash, value: message data)
+    unique_messages = {}
     max_messages_per_channel = 1000  # Prevent endless scanning
     activity_logger.info(f"Starting to collect matched messages (max {max_messages_per_channel} per channel)...")
     
@@ -1481,17 +1482,17 @@ async def scan_channels_for_last_24h_portfolio_messages():
                 channel_logger.debug(log_msg)
                 
                 # Check if this message matches our portfolio OR macro keywords
-                is_matched, match_type, entity = await execute_two_tier_filter(text_content)
+                is_matched, match_type, entities = await execute_two_tier_filter(text_content)
                 
                 if not is_matched:
                     channel_logger.info(f"[FILTERED (SCAN)] No match - Not in portfolio or macro keywords")
                     continue
                 
                 if match_type == "Portfolio Stock":
-                    channel_logger.info(f"[MATCHED (SCAN)] Portfolio stock found: {entity}")
+                    channel_logger.info(f"[MATCHED (SCAN)] Portfolio stocks found: {', '.join(entities)}")
                 else:  # Macro Economy
-                    channel_logger.info(f"[MATCHED (SCAN)] Macro keyword found: {entity}")
-                activity_logger.info(f"[MATCHED] Found {match_type}: {entity} in message: {deep_link} (date: {message_date_ist.strftime('%Y-%m-%d %H:%M:%S IST')})")
+                    channel_logger.info(f"[MATCHED (SCAN)] Macro keywords found: {', '.join(entities)}")
+                activity_logger.info(f"[MATCHED] Found {match_type}: {', '.join(entities)} in message: {deep_link} (date: {message_date_ist.strftime('%Y-%m-%d %H:%M:%S IST')})")
                 
                 # Skip if no text and no PDF
                 if not text_content and not has_pdf:
@@ -1499,19 +1500,44 @@ async def scan_channels_for_last_24h_portfolio_messages():
                     activity_logger.info(f"[SKIPPED] No text/PDF for message: {deep_link}")
                     continue
                 
+                # Generate message hash for deduplication
+                msg_hash = None
+                if text_content:
+                    normalised = _normalise(text_content)
+                    msg_hash = hashlib.sha256(normalised.encode()).hexdigest()
+                else:
+                    # For PDF-only, create hash from file ID if available
+                    if message.document and message.document.file_id:
+                        msg_hash = hashlib.sha256(message.document.file_id.encode()).hexdigest()
+                
+                # Skip if we already have this message
+                if msg_hash and msg_hash in unique_messages:
+                    channel_logger.info(f"[FILTERED (SCAN)] Duplicate message - Skipping")
+                    activity_logger.info(f"[SKIPPED] Duplicate message: {deep_link}")
+                    continue
+                
+                # Check if we've already processed this message before
+                if msg_hash and await db["recent_news_hashes"].find_one({"_id": msg_hash}):
+                    channel_logger.info(f"[FILTERED (SCAN)] Already processed message - Skipping")
+                    activity_logger.info(f"[SKIPPED] Already processed: {deep_link}")
+                    continue
+                
                 messages_matched_this_channel += 1
                 activity_logger.info(f"Adding message to forward list: {deep_link}")
-                messages_to_forward.append({
+                
+                # Add to unique messages dict
+                unique_messages[msg_hash or str(message.id)] = {
                     "text": text_content,
                     "deep_link": deep_link,
                     "chat_id": channel_id,
                     "message_id": message.id,
                     "has_pdf": has_pdf,
-                    "entity": entity,
+                    "entities": entities,
                     "channel_label": channel_label,
                     "date": message_date_ist,
-                    "match_type": match_type
-                })
+                    "match_type": match_type,
+                    "msg_hash": msg_hash
+                }
             
             activity_logger.info(f"Channel {channel_label} done: scanned {messages_scanned}, matched {messages_matched_this_channel}, stopped early: {messages_beyond_cutoff >=5}")
         except Exception as e:
@@ -1522,7 +1548,9 @@ async def scan_channels_for_last_24h_portfolio_messages():
             activity_logger.error(f"Stack trace: {traceback.format_exc()}")
             continue
     
-    activity_logger.info(f"Total matched messages to forward: {len(messages_to_forward)}")
+    # Convert unique_messages dict to list
+    messages_to_forward = list(unique_messages.values())
+    activity_logger.info(f"Total unique matched messages to forward: {len(messages_to_forward)}")
     if not messages_to_forward:
         logger.info("No last 24 hour messages found.")
         activity_logger.info("No last 24 hour messages found during scan.")
@@ -1542,7 +1570,7 @@ async def scan_channels_for_last_24h_portfolio_messages():
         portfolio_file_content += f"--- Message {idx} ---\n"
         portfolio_file_content += f"Posted on: {msg['date'].strftime('%Y-%m-%d %H:%M:%S IST')}\n"
         portfolio_file_content += f"From Channel: {msg['channel_label']}\n"
-        portfolio_file_content += f"Entity (Portfolio Stock): {msg['entity']}\n"
+        portfolio_file_content += f"Entities (Portfolio Stocks): {', '.join(msg['entities'])}\n"
         if msg["text"]:
             portfolio_file_content += f"Content:\n{msg['text']}\n"
         portfolio_file_content += "\n"
@@ -1552,12 +1580,12 @@ async def scan_channels_for_last_24h_portfolio_messages():
         macro_file_content += f"--- Message {idx} ---\n"
         macro_file_content += f"Posted on: {msg['date'].strftime('%Y-%m-%d %H:%M:%S IST')}\n"
         macro_file_content += f"From Channel: {msg['channel_label']}\n"
-        macro_file_content += f"Entity (Macro Economy): {msg['entity']}\n"
+        macro_file_content += f"Entities (Macro Keywords): {', '.join(msg['entities'])}\n"
         if msg["text"]:
             macro_file_content += f"Content:\n{msg['text']}\n"
         macro_file_content += "\n"
     
-    logger.info(f"Found {len(messages_to_forward)} last 24 hour messages to forward.")
+    logger.info(f"Found {len(messages_to_forward)} last 24 hour unique messages to forward.")
     activity_logger.info(f"="*80)
     activity_logger.info(f"STARTING TO FORWARD LAST 24 HOUR MESSAGES ({len(messages_to_forward)} found)")
     activity_logger.info(f"="*80)
@@ -1569,14 +1597,14 @@ async def scan_channels_for_last_24h_portfolio_messages():
             await bot.send_message(
                 owner,
                 f"🔍 **Last 24 Hour Data Found**\n\n"
-                f"Found {len(messages_to_forward)} messages (portfolio + macro) from the last 24 hours.\n"
+                f"Found {len(messages_to_forward)} unique messages (portfolio + macro) from the last 24 hours.\n"
                 f"Forwarding them now, plus summary text files...",
                 link_preview=False
             )
             activity_logger.info(f"✓ Summary sent to owner: {owner}")
             
             for idx, msg in enumerate(messages_to_forward, 1):
-                activity_logger.info(f"[{idx}/{len(messages_to_forward)}] Forwarding message: {msg['deep_link']} (Entity: {msg['entity']}, Type: {msg['match_type']}, date: {msg['date'].strftime('%Y-%m-%d %H:%M:%S IST')})")
+                activity_logger.info(f"[{idx}/{len(messages_to_forward)}] Forwarding message: {msg['deep_link']} (Entities: {', '.join(msg['entities'])}, Type: {msg['match_type']}, date: {msg['date'].strftime('%Y-%m-%d %H:%M:%S IST')})")
                 
                 try:
                     # First, try to forward the actual message using the user session
@@ -1589,7 +1617,7 @@ async def scan_channels_for_last_24h_portfolio_messages():
                     # Add a note saying it's last 24 hour data
                     await bot.send_message(
                         owner,
-                        f"📜 **Last 24 Hour Data** about **{msg['entity']}**\n"
+                        f"📜 **Last 24 Hour Data** about **{', '.join(msg['entities'])}**\n"
                         f"From: {msg['channel_label']}\n"
                         f"Date: {msg['date'].strftime('%Y-%m-%d %H:%M:%S IST')}",
                         link_preview=False
@@ -1611,7 +1639,7 @@ async def scan_channels_for_last_24h_portfolio_messages():
                 else:
                     # For portfolio news, send full content including PDF
                     header = (
-                        f"📜 **Last 24 Hour Portfolio Data** about **{msg['entity']}**\n"
+                        f"📜 **Last 24 Hour Portfolio Data** about **{', '.join(msg['entities'])}**\n"
                         f"From: {msg['channel_label']}\n"
                         f"Date: {msg['date'].strftime('%Y-%m-%d %H:%M:%S IST')}\n"
                         f"Source: {msg['deep_link']}\n"
@@ -1627,7 +1655,7 @@ async def scan_channels_for_last_24h_portfolio_messages():
                             original_message = await user.get_messages(msg["chat_id"], ids=msg["message_id"])
                             
                             # Extract the proper filename
-                            pdf_filename = extract_real_filename(original_message, msg["entity"])
+                            pdf_filename = extract_real_filename(original_message, msg['entities'][0])
                             
                             # Download and send via bot (most reliable method)
                             logger.debug(f"[PDF SEND (SCAN)] About to download media!")
@@ -1641,7 +1669,7 @@ async def scan_channels_for_last_24h_portfolio_messages():
                                 await bot.send_file(
                                     owner,
                                     pdf_bytesio,
-                                    caption=f"PDF about {msg['entity']} from {msg['channel_label']}\nSource: {msg['deep_link']}"
+                                    caption=f"PDF about {', '.join(msg['entities'])} from {msg['channel_label']}\nSource: {msg['deep_link']}"
                                 )
                                 activity_logger.info(f"  ✓ PDF sent successfully with filename: {pdf_filename}")
                             else:
@@ -1698,6 +1726,16 @@ async def scan_channels_for_last_24h_portfolio_messages():
             activity_logger.error(f"✗ Failed to forward messages to owner {owner}: {e}")
             import traceback
             activity_logger.error(f"Stack trace: {traceback.format_exc()}")
+    
+    # Mark all forwarded messages as processed
+    for msg in messages_to_forward:
+        if msg['msg_hash']:
+            await db["recent_news_hashes"].update_one(
+                {"_id": msg['msg_hash']},
+                {"$set": {"_id": msg['msg_hash'], "ts": datetime.now(IST)}},
+                upsert=True
+            )
+    
     activity_logger.info("Scan and forwarding complete!")
 
 
@@ -1716,7 +1754,12 @@ async def compile_and_dispatch_daily_report():
 
     compiled_data_block = ""
     for idx, item in enumerate(logs):
-        compiled_data_block += f"--- BLOCK ENTRY {idx+1} ({item['matched_entity']}) ---\n"
+        # Handle both old (matched_entity) and new (matched_entities) log entries
+        if 'matched_entities' in item:
+            entity_label = ', '.join([', '.join(ents) for ents in item['matched_entities']])
+        else:
+            entity_label = item['matched_entity']
+        compiled_data_block += f"--- BLOCK ENTRY {idx+1} ({entity_label}) ---\n"
         compiled_data_block += f"{item['analysis_output']}\n\n"
 
     master_compiler_prompt = f"""
