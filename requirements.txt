@@ -1,0 +1,6 @@
+telethon
+motor
+google-genai
+apscheduler
+python-dotenv
+flask
