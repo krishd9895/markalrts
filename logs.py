@@ -1,60 +1,80 @@
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
+from config import MAX_LOG_AGE_HOURS, MAX_LOG_SIZE_BYTES
 
-# Indian Standard Time: UTC+5:30 (duplicate from config to avoid import issues)
+# Indian Standard Time: UTC+5:30
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# Maximum log file size in bytes (2 MB)
-MAX_LOG_SIZE = 2 * 1024 * 1024  # 2,097,152 bytes
+
+# Custom logging formatter to use IST time
+class ISTFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, IST)
+        if datefmt:
+            return dt.strftime(datefmt)
+        else:
+            return dt.strftime("%Y-%m-%d %H:%M:%S IST")
 
 
-def manage_log_size(log_filename):
-    """
-    Checks if log file exceeds MAX_LOG_SIZE and trims it if necessary.
-    Keeps the most recent log entries.
-    """
-    if not os.path.exists(log_filename):
+def trim_log_file(log_path):
+    """Trim old lines from log file when it exceeds max size, or when entries are too old."""
+    if not os.path.exists(log_path):
         return
     
-    file_size = os.path.getsize(log_filename)
-    if file_size <= MAX_LOG_SIZE:
-        return
+    file_size = os.path.getsize(log_path)
+    now = datetime.now(IST)
+    cutoff_time = now - timedelta(hours=MAX_LOG_AGE_HOURS)
     
-    # Log file is too big - trim it
     try:
-        with open(log_filename, 'r', encoding='utf-8') as f:
+        with open(log_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         
-        # Calculate how many lines to keep (keep about 60% of the file)
-        target_size = int(MAX_LOG_SIZE * 0.6)
-        approx_lines_to_keep = int(len(lines) * (target_size / file_size))
+        # First filter out lines older than MAX_LOG_AGE_HOURS
+        filtered_lines = []
+        for line in lines:
+            # Try to parse timestamp from line
+            timestamp_match = re.match(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', line)
+            if timestamp_match:
+                try:
+                    # Parse the timestamp
+                    line_time_str = timestamp_match.group(1)
+                    line_time = datetime.strptime(line_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
+                    if line_time >= cutoff_time:
+                        filtered_lines.append(line)
+                except Exception:
+                    # If timestamp parsing fails, keep the line
+                    filtered_lines.append(line)
+            else:
+                # If no timestamp, keep the line
+                filtered_lines.append(line)
         
-        # Ensure we keep at least 100 lines
-        approx_lines_to_keep = max(approx_lines_to_keep, 100)
+        # Now check if we still need to trim more lines to get under size limit
+        # Estimate size per line
+        total_size = sum(len(line.encode('utf-8')) for line in filtered_lines)
         
-        # Keep the most recent lines
-        lines_to_keep = lines[-approx_lines_to_keep:]
+        while total_size > MAX_LOG_SIZE_BYTES and len(filtered_lines) > 0:
+            # Remove oldest line
+            removed = filtered_lines.pop(0)
+            total_size -= len(removed.encode('utf-8'))
         
-        # Write back the trimmed content
-        with open(log_filename, 'w', encoding='utf-8') as f:
-            f.writelines(lines_to_keep)
-        
-        print(f"Trimmed log file {log_filename} from {file_size} bytes to ~{target_size} bytes")
+        # Write trimmed lines back to file
+        with open(log_path, 'w', encoding='utf-8') as f:
+            f.writelines(filtered_lines)
+    
     except Exception as e:
-        print(f"Error trimming log file {log_filename}: {e}")
+        print(f"Error trimming log file {log_path}: {e}")
 
 
-class SizeManagedFileHandler(logging.FileHandler):
-    """
-    Custom FileHandler that checks and manages log size before emitting records.
-    """
+class ManagedFileHandler(logging.FileHandler):
+    """Custom file handler that manages log file size and age before emitting each record."""
     def emit(self, record):
         try:
-            # Check log size before emitting
+            # Trim log file before emitting new record
             if self.stream:
                 self.stream.flush()
-                manage_log_size(self.baseFilename)
+                trim_log_file(self.baseFilename)
             # Call parent class emit
             super().emit(record)
         except Exception:
@@ -62,94 +82,99 @@ class SizeManagedFileHandler(logging.FileHandler):
 
 
 def setup_channel_logger():
-    """
-    Sets up a logger that writes detailed channel activity to a file ONLY.
-    Logs all messages/PDFs seen in channels and whether they match our portfolio.
-    No console output - only file logging.
-    """
-    # Create logs directory if it doesn't exist
     logs_dir = "channel_logs"
     if not os.path.exists(logs_dir):
         os.makedirs(logs_dir)
 
-    # Create a unique log filename with today's date
-    today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    log_filename = os.path.join(logs_dir, f"channel_activity_{today_str}.log")
+    log_filename = os.path.join(logs_dir, "channel_activity.log")
+    
+    # Trim log file on startup
+    trim_log_file(log_filename)
 
-    # Configure the logger
     logger = logging.getLogger("channel_activity")
     logger.setLevel(logging.DEBUG)
 
-    # Clear existing handlers to avoid duplicates
     if logger.handlers:
         logger.handlers.clear()
 
-    # Size-managed file handler
-    file_handler = SizeManagedFileHandler(log_filename, encoding="utf-8")
+    file_handler = ManagedFileHandler(log_filename, encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
 
-    # Log format
-    log_format = logging.Formatter(
+    log_format = ISTFormatter(
         "%(asctime)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S IST"
     )
 
     file_handler.setFormatter(log_format)
-
     logger.addHandler(file_handler)
-
-    # Prevent the logger from propagating to the root logger (which might have console handlers)
     logger.propagate = False
-
+    
+    logger.info("Channel activity logger initialized successfully!")
     return logger
 
 
-def setup_activity_logger():
-    """
-    Sets up a logger that tracks AI analysis and user forwards to a file ONLY.
-    Logs:
-    - What messages were forwarded to users
-    - What was sent to AI
-    - Whether AI analysis succeeded or failed
-    No console output - only file logging.
-    """
-    # Create logs directory if it doesn't exist
-    logs_dir = "activity_logs"
+def setup_bot_activity_logger():
+    logs_dir = "bot_activity_logs"
     if not os.path.exists(logs_dir):
         os.makedirs(logs_dir)
 
-    # Create a unique log filename with today's date
-    today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    log_filename = os.path.join(logs_dir, f"activity_{today_str}.log")
+    log_filename = os.path.join(logs_dir, "bot_activity.log")
+    
+    # Trim log file on startup
+    trim_log_file(log_filename)
 
-    # Configure the logger
-    logger = logging.getLogger("activity")
+    logger = logging.getLogger("bot_activity")
     logger.setLevel(logging.DEBUG)
 
-    # Clear existing handlers to avoid duplicates
     if logger.handlers:
         logger.handlers.clear()
 
-    # Size-managed file handler
-    file_handler = SizeManagedFileHandler(log_filename, encoding="utf-8")
+    file_handler = ManagedFileHandler(log_filename, encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
 
-    # Log format
-    log_format = logging.Formatter(
+    log_format = ISTFormatter(
         "%(asctime)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S IST"
     )
 
     file_handler.setFormatter(log_format)
-
     logger.addHandler(file_handler)
-
-    # Prevent the logger from propagating to the root logger (which might have console handlers)
     logger.propagate = False
+    
+    logger.info("Bot activity logger initialized successfully!")
+    return logger
 
+
+def setup_ocr_logger():
+    logs_dir = "ocr_logs"
+    if not os.path.exists(logs_dir):
+        os.makedirs(logs_dir)
+
+    log_filename = os.path.join(logs_dir, "ocr_activity.log")
+    
+    # Trim log file on startup
+    trim_log_file(log_filename)
+
+    logger = logging.getLogger("ocr_activity")
+    logger.setLevel(logging.INFO)
+
+    if logger.handlers:
+        logger.handlers.clear()
+
+    file_handler = ManagedFileHandler(log_filename, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+
+    # No timestamps for OCR logs - just clean messages
+    log_format = logging.Formatter("%(message)s")
+    file_handler.setFormatter(log_format)
+    logger.addHandler(file_handler)
+    logger.propagate = False
+    
+    logger.info("OCR activity logger initialized successfully!")
     return logger
 
 
 # Global logger instances
 channel_logger = setup_channel_logger()
-activity_logger = setup_activity_logger()
+bot_activity_logger = setup_bot_activity_logger()
+ocr_logger = setup_ocr_logger()
