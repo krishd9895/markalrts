@@ -71,7 +71,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # Local modules
 from config import API_ID, API_HASH, BOT_TOKEN, OWNERS, MONITORED_CHANNELS, db
 from logs import channel_logger, bot_activity_logger, ocr_logger
-from ocr import image_to_text
+from ocr import image_to_text, test_google_credentials
 from progress import ProgressManager
 
 # Setup logging
@@ -913,6 +913,7 @@ async def callback_dispatcher(event: events.CallbackQuery.Event):
         if google_creds and google_creds.get("token"):
             kbd.append([Button.inline("📥 Download OAuth token.json", data="download_google_token")])
         kbd.extend([
+            [Button.inline("✅ Test Google Drive Credentials", data="test_google_creds")],
             [Button.inline("📤 Upload Service Account Key (Recommended)", data="upload_service_account")],
             [Button.inline("📤 Upload OAuth credentials.json", data="upload_google_creds")],
             [Button.inline("📤 Upload OAuth token.json", data="upload_google_token")],
@@ -991,19 +992,28 @@ async def callback_dispatcher(event: events.CallbackQuery.Event):
             flow = InstalledAppFlow.from_client_config(google_creds["credentials"], SCOPES)
             flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"  # This is the special redirect URI for manual code flow
             
-            # Generate authorization URL
-            auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline", include_granted_scopes="true")
+            # Generate authorization URL and get PKCE code verifier
+            auth_url, state = flow.authorization_url(
+                prompt="consent", 
+                access_type="offline", 
+                include_granted_scopes="true",
+                code_challenge_method="S256"  # Enable PKCE
+            )
             
-            # Store the flow in user state (we'll need to recreate it later with the code, but let's at least store that we're in the flow)
-            USER_STATES[user_id] = {"action": "AWAITING_OAUTH_CODE"}
+            # Store the code verifier and flow state in USER_STATES
+            USER_STATES[user_id] = {
+                "action": "AWAITING_OAUTH_CODE",
+                "code_verifier": flow.code_verifier,
+                "state": state
+            }
             
             # Send the auth URL to the user
             await event.edit(
                 f"🔗 **OAuth Authentication Flow Started!**\n\n"
-                f"⚠️ **Important**: First, make sure you've added `urn:ietf:wg:oauth:2.0:oob` as an authorized redirect URI in your Google Cloud Console!\n\n"
+                f"💡 **Pro Tip**: Using a Service Account is much easier and doesn't require this flow! You can upload a Service Account JSON key instead.\n\n"
                 f"Please click the link below to authenticate with your Google account on your phone browser:\n"
                 f"{auth_url}\n\n"
-                f"After authenticating, you will get an authorization code. Please send that code here to complete the process.",
+                f"After authenticating, copy the authorization code and send it here.",
                 buttons=[[Button.inline("❌ Cancel", data="back_to_settings")]]
             )
         except Exception as e:
@@ -1012,6 +1022,66 @@ async def callback_dispatcher(event: events.CallbackQuery.Event):
     elif data == "upload_service_account":
         USER_STATES[user_id] = {"action": "AWAITING_SERVICE_ACCOUNT"}
         await event.edit("📤 Please upload your service account JSON key file (from Google Cloud Console - recommended, no token refresh needed!):", buttons=[[Button.inline("❌ Cancel", data="back_to_settings")]])
+    
+    elif data == "test_google_creds":
+        # Test the Google Drive credentials
+        await event.answer("Testing Google Drive credentials...")
+        success, message, details = await test_google_credentials(db)
+        
+        # Build detailed status message
+        status_text = f"📄 **Google Drive Credentials**\n\n"
+        status_text += f"**Stored Credentials:**\n"
+        status_text += f"- Service Account: {'✅ Yes' if details['service_account'] else '❌ No'}\n"
+        status_text += f"- OAuth Credentials: {'✅ Yes' if details['oauth_credentials'] else '❌ No'}\n"
+        status_text += f"- OAuth Token: {'✅ Yes' if details['oauth_token'] else '❌ No'}\n\n"
+        status_text += f"**Test Result:**\n{message}\n\n"
+        
+        # Add how to get credentials if test failed
+        if not success:
+            status_text += f"\n**How to get credentials:**\n\n"
+            status_text += f"**Service Account (Recommended):**\n"
+            status_text += f"1. Go to https://console.cloud.google.com/\n"
+            status_text += f"2. Create a new project or select existing one\n"
+            status_text += f"3. Enable 'Google Drive API' for the project\n"
+            status_text += f"4. Go to 'IAM & Admin' → 'Service Accounts'\n"
+            status_text += f"5. Create a new service account\n"
+            status_text += f"6. Click 'Add Key' → 'Create New Key' → select JSON\n"
+            status_text += f"7. Share your Google Drive folder/files with the service account email (found in the JSON file)\n\n"
+            status_text += f"**OAuth 2.0:**\n"
+            status_text += f"1. Go to https://console.cloud.google.com/\n"
+            status_text += f"2. Create a new project or select existing one\n"
+            status_text += f"3. Enable 'Google Drive API' for the project\n"
+            status_text += f"4. Go to 'APIs & Services' → 'Credentials'\n"
+            status_text += f"5. Create credentials → 'OAuth client ID'\n"
+            status_text += f"6. Application type: 'Desktop app'\n"
+            status_text += f"7. Download the JSON credentials file\n"
+        
+        # Rebuild keyboard
+        kbd = []
+        google_creds = await db["config"].find_one({"_id": "google_drive_creds"})
+        if google_creds and google_creds.get("service_account"):
+            kbd.append([Button.inline("📥 Download service account key", data="download_service_account")])
+        if google_creds and google_creds.get("credentials"):
+            kbd.append([Button.inline("📥 Download OAuth credentials.json", data="download_google_creds")])
+        if google_creds and google_creds.get("token"):
+            kbd.append([Button.inline("📥 Download OAuth token.json", data="download_google_token")])
+        kbd.extend([
+            [Button.inline("✅ Test Google Drive Credentials", data="test_google_creds")],
+            [Button.inline("📤 Upload Service Account Key (Recommended)", data="upload_service_account")],
+            [Button.inline("📤 Upload OAuth credentials.json", data="upload_google_creds")],
+            [Button.inline("📤 Upload OAuth token.json", data="upload_google_token")],
+        ])
+        if google_creds and google_creds.get("credentials"):
+            kbd.append([Button.inline("🔗 Start OAuth Authentication Flow (Phone)", data="start_oauth_flow")])
+        kbd.append([Button.inline("⬅️ Back", data="back_to_settings")])
+        
+        try:
+            await event.edit(status_text, buttons=kbd)
+        except Exception as e:
+            # Ignore MessageNotModifiedError - it just means the content didn't change
+            from telethon.errors.rpcerrorlist import MessageNotModifiedError
+            if not isinstance(e, MessageNotModifiedError):
+                raise
     
     elif data == "upload_google_token":
         USER_STATES[user_id] = {"action": "AWAITING_GOOGLE_TOKEN"}
@@ -1595,9 +1665,12 @@ async def functional_input_processor(event: events.NewMessage.Event):
             SCOPES = ["https://www.googleapis.com/auth/drive"]
             import json
             
-            # Recreate the flow and exchange the code for tokens
+            # Recreate the flow with the stored code verifier
             flow = InstalledAppFlow.from_client_config(google_creds["credentials"], SCOPES)
             flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"  # Same redirect URI as before
+            flow.code_verifier = state.get("code_verifier")  # Use stored code verifier
+            
+            # Exchange the code for tokens
             creds = flow.fetch_token(code=auth_code)
             
             # Convert credentials to a serializable dict
@@ -2135,6 +2208,10 @@ async def incoming_stream_pipeline(event: events.NewMessage.Event):
         else:
             ocr_channel_ids.add(int(ch))
     
+    # Process if in monitored OR OCR channels
+    if event.chat_id not in monitored_ids and event.chat_id not in ocr_channel_ids:
+        return
+    
     # Commented out unnecessary repeated logs
     # channel_logger.info(f"[LIVE MONITOR] Monitored channel IDs: {sorted(monitored_ids)}")
     # channel_logger.info(f"[LIVE MONITOR] OCR channel IDs: {sorted(ocr_channel_ids)}")
@@ -2170,8 +2247,8 @@ async def incoming_stream_pipeline(event: events.NewMessage.Event):
 
     has_photo = bool(event.photo)
 
-    # Log EVERY message we see in monitored channels
-    if event.chat_id in monitored_ids:
+    # Log EVERY message we see in monitored or OCR channels
+    if event.chat_id in monitored_ids or event.chat_id in ocr_channel_ids:
         # Short preview of text content (max 100 chars)
         short_text = (text_content[:100] + "...") if len(text_content) > 100 else (text_content or "(empty)")
         

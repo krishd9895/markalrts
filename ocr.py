@@ -1,10 +1,10 @@
-
 import io
 import os
 import json
 import logging
 import asyncio
 from functools import partial
+from PIL import Image
 
 from google.oauth2.credentials import Credentials
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
@@ -12,6 +12,16 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
+
+# Try to import EasyOCR for fallback
+try:
+    import easyocr
+    EASYOCR_AVAILABLE = True
+    # Initialize reader once at module level for efficiency
+    EASYOCR_READER = None
+except ImportError:
+    EASYOCR_AVAILABLE = False
+    EASYOCR_READER = None
 
 # The scope needed to upload, read, and delete files for OCR
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -74,7 +84,19 @@ async def save_service_account_to_db(db, service_account_data):
 
 def _sync_get_drive_service(creds):
     """Synchronous function to build Drive service."""
-    return build('drive', 'v3', credentials=creds)
+    return build('drive', 'v3', credentials=creds, cache_discovery=False)
+
+
+def _sync_test_credentials(creds):
+    """Synchronous function to test Google Drive credentials by listing files."""
+    # Silence file_cache warning by disabling cache
+    service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+    try:
+        # Try to list first 5 files to verify connection works
+        results = service.files().list(pageSize=5, fields="files(id, name)").execute()
+        return True, results.get('files', [])
+    except Exception as e:
+        raise e
 
 
 def _sync_image_to_text(service, image_data, image_name="Temp_OCR_File.jpg"):
@@ -99,21 +121,129 @@ def _sync_image_to_text(service, image_data, image_name="Temp_OCR_File.jpg"):
 
     file_id = uploaded_file.get('id')
 
-    # Export as plain text from the generated Google Doc
-    request = service.files().export_media(fileId=file_id, mimeType='text/plain')
+    try:
+        # Export as plain text from the generated Google Doc
+        request = service.files().export_media(fileId=file_id, mimeType='text/plain')
 
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
 
-    extracted_text = fh.getvalue().decode('utf-8')
-
-    # Clean up the temporary Drive file
-    service.files().delete(fileId=file_id).execute()
+        extracted_text = fh.getvalue().decode('utf-8')
+    finally:
+        # Always clean up the temporary Drive file, even if OCR fails
+        try:
+            service.files().delete(fileId=file_id).execute()
+        except Exception as e:
+            # Don't fail the whole OCR just because cleanup failed
+            pass
 
     return extracted_text
+
+
+def _sync_cleanup_old_temp_files(service):
+    """Synchronous function to delete old Temp_OCR_File files from Drive."""
+    try:
+        # List all files named Temp_OCR_File
+        results = service.files().list(
+            q="name='Temp_OCR_File'",
+            fields="files(id, name)",
+            pageSize=100
+        ).execute()
+        
+        files = results.get('files', [])
+        deleted_count = 0
+        
+        for file in files:
+            try:
+                service.files().delete(fileId=file['id']).execute()
+                deleted_count += 1
+            except Exception as e:
+                pass  # Skip files that can't be deleted
+                
+        return deleted_count
+    except Exception as e:
+        return 0
+
+
+def _sync_easyocr_image_to_text(image_data):
+    """Synchronous function to perform OCR using EasyOCR as fallback."""
+    global EASYOCR_READER
+    
+    if not EASYOCR_AVAILABLE:
+        raise ImportError("EasyOCR is not installed")
+    
+    # Initialize reader if not already initialized
+    if EASYOCR_READER is None:
+        # Use English by default, can be expanded to other languages
+        EASYOCR_READER = easyocr.Reader(['en'], gpu=False)  # GPU=False for Docker compatibility
+    
+    # Load image from BytesIO
+    image = Image.open(image_data)
+    
+    # Perform OCR
+    results = EASYOCR_READER.readtext(image, detail=0)
+    
+    # Join results into a single string
+    extracted_text = '\n'.join(results)
+    
+    return extracted_text
+
+
+async def test_google_credentials(db):
+    """Test Google Drive credentials (service account first, then OAuth). Returns (success: bool, message: str, details: dict)"""
+    from functools import partial
+    import asyncio
+    loop = asyncio.get_event_loop()
+    
+    # Get what's stored in DB
+    creds_doc = await db["config"].find_one({"_id": "google_drive_creds"})
+    
+    if not creds_doc:
+        details = {
+            "service_account": None,
+            "oauth_credentials": None,
+            "oauth_token": None
+        }
+        return False, "❌ No Google Drive credentials stored in the database.", details
+    
+    details = {
+        "service_account": creds_doc.get("service_account") is not None,
+        "oauth_credentials": creds_doc.get("credentials") is not None,
+        "oauth_token": creds_doc.get("token") is not None
+    }
+    
+    creds, _ = await get_credentials_from_db(db)
+    
+    if not creds:
+        if details["service_account"]:
+            return False, "❌ Service account found but failed to load.", details
+        elif details["oauth_credentials"] and not details["oauth_token"]:
+            return False, "❌ OAuth credentials found but no token present.", details
+        elif details["oauth_token"]:
+            return False, "❌ OAuth token found but failed to load.", details
+        else:
+            return False, "❌ No valid Google Drive credentials found in the database.", details
+    
+    try:
+        # First, build the service
+        service = await loop.run_in_executor(None, _sync_get_drive_service, creds)
+        
+        # Clean up old temp files
+        deleted_count = await loop.run_in_executor(None, _sync_cleanup_old_temp_files, service)
+        
+        # Test credentials
+        success, files = await loop.run_in_executor(None, _sync_test_credentials, creds)
+        if success:
+            cred_type = "Service Account" if details["service_account"] else "OAuth 2.0"
+            cleanup_msg = f" Cleaned up {deleted_count} old temp file(s)." if deleted_count > 0 else ""
+            return True, f"✅ Google Drive {cred_type} credentials are working correctly! Successfully listed {len(files)} file(s) from your Drive.{cleanup_msg}", details
+    except Exception as e:
+        return False, f"❌ Google Drive credentials test failed: {str(e)}", details
+    
+    return False, "❌ Failed to verify credentials.", details
 
 
 async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_OCR_File.jpg"):
@@ -128,15 +258,27 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
             "image_to_text() no longer accepts file paths. "
             "Pass image bytes or BytesIO instead."
         )
+    
+    # Make a copy of image data for possible fallback (since BytesIO is read-once)
+    image_bytes = None
     if isinstance(image_data, (bytes, bytearray)):
+        image_bytes = image_data
         image_data = io.BytesIO(image_data)
+    else:
+        # If it's already a BytesIO, reset it and make a copy
+        image_data.seek(0)
+        image_bytes = image_data.read()
+        image_data = io.BytesIO(image_bytes)
 
     loop = asyncio.get_event_loop()
 
     creds, credentials_data = await get_credentials_from_db(db)
-
-    # Check if we've already notified about auth issues
+    
+    # Check what type of credentials we have
     google_creds_doc = await db["config"].find_one({"_id": "google_drive_creds"})
+    is_service_account = google_creds_doc and google_creds_doc.get("service_account") is not None
+    
+    # Check if we've already notified about auth issues
     already_notified = google_creds_doc.get("already_notified_auth_issue", False) if google_creds_doc else False
 
     # If we have valid credentials, reset the notification flag
@@ -147,6 +289,8 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
         )
         already_notified = False
 
+    use_drive_api = True
+    
     if not creds:
         ocr_logger.warning("No Google Drive credentials found in DB. Authentication required.")
         if bot and owners and not already_notified:
@@ -186,10 +330,11 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
                 {"$set": {"already_notified_auth_issue": False}}
             )
             ocr_logger.info("New credentials obtained and saved to DB.")
-        elif credentials_data is None:
-            raise Exception("No Google Drive credentials found. Please upload a service account key or OAuth credentials via the bot's /settings menu.")
+        else:
+            use_drive_api = False
 
-    elif not creds.valid:
+    elif not is_service_account and not creds.valid:
+        # Only check validity and refresh for OAuth credentials, not service accounts
         if creds.expired and creds.refresh_token:
             try:
                 ocr_logger.info("Access token expired. Refreshing...")
@@ -226,7 +371,7 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
                         {"$set": {"already_notified_auth_issue": True}},
                         upsert=True
                     )
-                raise e
+                use_drive_api = False
         else:
             ocr_logger.warning("Credentials invalid and no refresh token. Re-authenticating...")
             if bot and owners and not already_notified:
@@ -267,13 +412,38 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
                 )
                 ocr_logger.info("Re-authentication complete. New credentials saved.")
             else:
-                raise Exception("No credentials.json found locally and no token available. Please upload credentials.json and token.json via the bot's /settings menu.")
+                use_drive_api = False
 
-    service = await loop.run_in_executor(None, _sync_get_drive_service, creds)
-    extracted_text = await loop.run_in_executor(
-        None, partial(_sync_image_to_text, service, image_data, image_name)
-    )
-    return extracted_text
+    # Try Drive API first
+    if use_drive_api:
+        try:
+            # Reset image_data pointer
+            image_data.seek(0)
+            service = await loop.run_in_executor(None, _sync_get_drive_service, creds)
+            extracted_text = await loop.run_in_executor(
+                None, partial(_sync_image_to_text, service, image_data, image_name)
+            )
+            ocr_logger.info("Successfully extracted text using Google Drive API")
+            return extracted_text
+        except Exception as e:
+            ocr_logger.warning(f"Google Drive API failed: {e}. Trying EasyOCR fallback...")
+            # Fall through to EasyOCR
+    
+    # Try EasyOCR fallback
+    if EASYOCR_AVAILABLE:
+        try:
+            ocr_logger.info("Using EasyOCR fallback for OCR")
+            image_data_fallback = io.BytesIO(image_bytes)
+            extracted_text = await loop.run_in_executor(
+                None, _sync_easyocr_image_to_text, image_data_fallback
+            )
+            ocr_logger.info("Successfully extracted text using EasyOCR fallback")
+            return extracted_text
+        except Exception as e:
+            ocr_logger.error(f"EasyOCR fallback also failed: {e}")
+            raise Exception(f"Both Google Drive API and EasyOCR failed. Drive error: {str(e) if use_drive_api else 'No credentials'}, EasyOCR error: {str(e)}")
+    else:
+        raise Exception("Google Drive API failed and EasyOCR is not installed as fallback.")
 
 
 # ── Legacy synchronous helpers (kept for backwards compatibility) ─────────────
