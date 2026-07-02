@@ -5,6 +5,7 @@ import logging
 import asyncio
 from functools import partial
 from PIL import Image
+import httpx
 
 from google.oauth2.credentials import Credentials
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
@@ -13,11 +14,20 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
 
-# Try to import EasyOCR for fallback
+# Import config
+from config import EXTERNAL_OCR_SERVICE_URL
+
+# Try to import Tesseract for lightweight OCR as default local option
+try:
+    import pytesseract
+    TESSERACT_AVAILABLE = True
+except ImportError:
+    TESSERACT_AVAILABLE = False
+
+# Try to import EasyOCR as backup local option
 try:
     import easyocr
     EASYOCR_AVAILABLE = True
-    # Initialize reader once at module level for efficiency
     EASYOCR_READER = None
 except ImportError:
     EASYOCR_AVAILABLE = False
@@ -166,8 +176,22 @@ def _sync_cleanup_old_temp_files(service):
         return 0
 
 
+def _sync_tesseract_image_to_text(image_data):
+    """Synchronous function to perform OCR using Tesseract (lightweight default)."""
+    if not TESSERACT_AVAILABLE:
+        raise ImportError("Tesseract (pytesseract) is not installed")
+    
+    # Load image from BytesIO
+    image = Image.open(image_data)
+    
+    # Perform OCR
+    extracted_text = pytesseract.image_to_string(image)
+    
+    return extracted_text
+
+
 def _sync_easyocr_image_to_text(image_data):
-    """Synchronous function to perform OCR using EasyOCR as fallback."""
+    """Synchronous function to perform OCR using EasyOCR as backup."""
     global EASYOCR_READER
     
     if not EASYOCR_AVAILABLE:
@@ -190,8 +214,85 @@ def _sync_easyocr_image_to_text(image_data):
     return extracted_text
 
 
+def clean_ocr_text(text):
+    """Clean OCR text specifically for stock market alerts with aggressive noise removal"""
+    import re
+    
+    if not text:
+        return ""
+    
+    cleaned = text
+    
+    # Step 1: Normalize all whitespace
+    cleaned = re.sub(r'\r\n', '\n', cleaned)  # Normalize newlines
+    cleaned = re.sub(r'\r', '\n', cleaned)
+    cleaned = re.sub(r'[ \t]+', ' ', cleaned)  # Replace multiple spaces/tabs with single
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)  # Replace 3+ newlines with 2
+    
+    # Step 2: Remove common OCR garbage characters
+    garbage_chars = r'[^\x20-\x7E]'  # Remove non-ASCII characters
+    cleaned = re.sub(garbage_chars, '', cleaned)
+    
+    # Step 3: Remove lines that are mostly garbage (less than 30% alphanumeric)
+    lines = cleaned.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        line = line.strip()
+        if line:
+            alnum_count = sum(1 for c in line if c.isalnum())
+            if alnum_count >= 0.3 * len(line):  # Keep line if at least 30% alphanumeric
+                cleaned_lines.append(line)
+    
+    cleaned = '\n'.join(cleaned_lines)
+    
+    # Step 4: Final character whitelist for stock market
+    # Keep: letters, numbers, common symbols ($,%,.,,, -, (), [], {}, :, ;, +, =, @, #, &, *, /, \, |)
+    cleaned = re.sub(r'[^a-zA-Z0-9\s\n\-\$\%\.\,\(\)\[\]\{\}\:\;\+\=\@\#\&\*\/\\\|]', '', cleaned)
+    
+    # Step 5: Trim final whitespace
+    cleaned = re.sub(r'^\s+|\s+$', '', cleaned)
+    cleaned = re.sub(r'[ \t]+', ' ', cleaned)
+    cleaned = re.sub(r'\n{2,}', '\n\n', cleaned)
+    
+    return cleaned
+
+
+async def _sync_external_service_image_to_text(image_bytes):
+    """Synchronous function to perform OCR using external service (REST API."""
+    if not EXTERNAL_OCR_SERVICE_URL:
+        raise ValueError("External OCR service URL is not configured")
+    
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            files = {'file': ('image.jpg', image_bytes)}  # Use 'file' key as expected by your service
+            data = {'lang': 'eng'}  # Add language parameter
+            response = await client.post(
+                EXTERNAL_OCR_SERVICE_URL,
+                files=files,
+                data=data
+            )
+            response.raise_for_status()
+            
+            # First try to parse as JSON
+            try:
+                result = response.json()
+                if isinstance(result, dict):
+                    if 'text' in result:
+                        return result['text']
+                    if 'data' in result and isinstance(result['data'], dict) and 'text' in result['data']:
+                        return result['data']['text']
+            except:
+                pass  # If JSON parsing fails, treat as raw text
+            
+            # Fallback: return raw text response (your service returns raw text)
+            return response.text
+    except Exception as e:
+        raise RuntimeError(f"External OCR service failed: {str(e)}")
+
+
 async def test_google_credentials(db):
-    """Test Google Drive credentials (service account first, then OAuth). Returns (success: bool, message: str, details: dict)"""
+    """Test Google Drive credentials (service account first, then OAuth). Returns (success: bool, message: str, details: dict)
+    """
     from functools import partial
     import asyncio
     loop = asyncio.get_event_loop()
@@ -245,51 +346,59 @@ async def test_google_credentials(db):
 
 
 async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_OCR_File.jpg"):
-    """
-    Async wrapper for OCR with DB-based credentials storage.
-    Accepts BytesIO or bytes only — no disk reads or writes.
-    Optionally sends messages to owners if auth fails (without spamming).
+    """Async wrapper for OCR with multiple fallbacks:
+    1. External service (if configured)
+    2. Google Drive API
+    3. Tesseract
+    4. EasyOCR
     """
     # Reject file paths — bytes only to avoid disk usage
     if isinstance(image_data, str):
-        raise ValueError(
-            "image_to_text() no longer accepts file paths. "
-            "Pass image bytes or BytesIO instead."
-        )
+        raise ValueError("image_to_text() no longer accepts file paths. Pass image bytes or BytesIO instead.")
     
-    # Make a copy of image data for possible fallback (since BytesIO is read-once)
+    # Make a copy of image data for fallbacks (since BytesIO is read-once
     image_bytes = None
     if isinstance(image_data, (bytes, bytearray)):
         image_bytes = image_data
         image_data = io.BytesIO(image_data)
     else:
-        # If it's already a BytesIO, reset it and make a copy
         image_data.seek(0)
         image_bytes = image_data.read()
         image_data = io.BytesIO(image_bytes)
-
+    
     loop = asyncio.get_event_loop()
-
+    
     creds, credentials_data = await get_credentials_from_db(db)
     
     # Check what type of credentials we have
     google_creds_doc = await db["config"].find_one({"_id": "google_drive_creds"})
     is_service_account = google_creds_doc and google_creds_doc.get("service_account") is not None
     
-    # Check if we've already notified about auth issues
     already_notified = google_creds_doc.get("already_notified_auth_issue", False) if google_creds_doc else False
-
-    # If we have valid credentials, reset the notification flag
+    
+    # Reset notification flag if credentials are valid
     if creds and google_creds_doc and google_creds_doc.get("already_notified_auth_issue"):
         await db["config"].update_one(
             {"_id": "google_drive_creds"},
             {"$set": {"already_notified_auth_issue": False}}
         )
         already_notified = False
-
+    
+    # ── Try external OCR in order: external service → Google Drive → Tesseract → EasyOCR
+    extracted_text = None
+    
+    # 1. Try external service first
+    if EXTERNAL_OCR_SERVICE_URL:
+        try:
+            bot_activity_logger.info(f"Trying external OCR service at {EXTERNAL_OCR_SERVICE_URL}")
+            extracted_text = await _sync_external_service_image_to_text(image_bytes)
+            bot_activity_logger.info("Successfully extracted text using external OCR service")
+        except Exception as e:
+            bot_activity_logger.warning(f"External OCR failed: {e}")
+    
+    # 2. Try Google Drive API
     use_drive_api = True
     drive_error = None
-    
     if not creds:
         if bot and owners and not already_notified:
             for owner in owners:
@@ -308,13 +417,11 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
                     f"3. Go to /settings → 📄 Google Drive Credentials → 📤 Upload OAuth token.json\n"
                     f"4. Upload your new token.json file"
                 )
-            # Mark that we've notified the user
             await db["config"].update_one(
                 {"_id": "google_drive_creds"},
                 {"$set": {"already_notified_auth_issue": True}},
                 upsert=True
             )
-        # If we have credentials.json locally, we can still try the local flow as a fallback
         if os.path.exists('credentials.json'):
             with open('credentials.json', 'r') as f:
                 credentials_data = json.load(f)
@@ -322,22 +429,18 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
             creds = flow.run_local_server(port=0)
             token_data = json.loads(creds.to_json())
             await save_credentials_to_db(db, token_data, credentials_data)
-            # Reset notification flag since we've fixed the issue
             await db["config"].update_one(
                 {"_id": "google_drive_creds"},
                 {"$set": {"already_notified_auth_issue": False}}
             )
         else:
             use_drive_api = False
-
     elif not is_service_account and not creds.valid:
-        # Only check validity and refresh for OAuth credentials, not service accounts
         if creds.expired and creds.refresh_token:
             try:
                 creds.refresh(Request())
                 token_data = json.loads(creds.to_json())
                 await save_credentials_to_db(db, token_data)
-                # Reset notification flag since we've fixed the issue
                 await db["config"].update_one(
                     {"_id": "google_drive_creds"},
                     {"$set": {"already_notified_auth_issue": False}}
@@ -360,7 +463,6 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
                             f"2. Go to /settings → 📄 Google Drive Credentials → 📤 Upload OAuth token.json\n"
                             f"3. Upload your new token.json file"
                         )
-                    # Mark that we've notified the user
                     await db["config"].update_one(
                         {"_id": "google_drive_creds"},
                         {"$set": {"already_notified_auth_issue": True}},
@@ -385,13 +487,11 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
                         f"3. Go to /settings → 📄 Google Drive Credentials → 📤 Upload OAuth token.json\n"
                         f"4. Upload your new token.json file"
                     )
-                # Mark that we've notified the user
                 await db["config"].update_one(
                     {"_id": "google_drive_creds"},
                     {"$set": {"already_notified_auth_issue": True}},
                     upsert=True
                 )
-            # If we have credentials.json locally, we can still try the local flow as a fallback
             if os.path.exists('credentials.json'):
                 with open('credentials.json', 'r') as f:
                     credentials_data = json.load(f)
@@ -399,43 +499,50 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
                 creds = flow.run_local_server(port=0)
                 token_data = json.loads(creds.to_json())
                 await save_credentials_to_db(db, token_data, credentials_data)
-                # Reset notification flag since we've fixed the issue
                 await db["config"].update_one(
                     {"_id": "google_drive_creds"},
                     {"$set": {"already_notified_auth_issue": False}}
                 )
             else:
                 use_drive_api = False
-
-    # Try Drive API first
-    extracted_text = None
-    if use_drive_api:
+    
+    # 2. Try Google Drive API if no text yet
+    if not extracted_text and use_drive_api:
         try:
-            # Reset image data pointer
             image_data.seek(0)
             service = await loop.run_in_executor(None, _sync_get_drive_service, creds)
             extracted_text = await loop.run_in_executor(
                 None, partial(_sync_image_to_text, service, image_data, image_name)
             )
-            return extracted_text
+            bot_activity_logger.info("Successfully extracted text using Google Drive API")
         except Exception as e:
             drive_error = str(e)
             bot_activity_logger.warning(f"Google Drive API failed: {e}")
-            # Fall through to EasyOCR
     
-    # Try EasyOCR fallback
-    if EASYOCR_AVAILABLE:
+    # 3. Try Tesseract if no text yet
+    if not extracted_text and TESSERACT_AVAILABLE:
         try:
             image_data_fallback = io.BytesIO(image_bytes)
-            extracted_text = await loop.run_in_executor(
-                None, _sync_easyocr_image_to_text, image_data_fallback
-            )
-            return extracted_text
+            extracted_text = await loop.run_in_executor(None, _sync_tesseract_image_to_text, image_data_fallback)
+            bot_activity_logger.info("Successfully extracted text using Tesseract OCR")
         except Exception as e:
-            bot_activity_logger.error(f"EasyOCR fallback failed: {e}")
-            raise Exception(f"Both Google Drive API and EasyOCR failed. Drive error: {drive_error if use_drive_api else 'No credentials'}, EasyOCR error: {str(e)}")
-    else:
-        raise Exception("Google Drive API failed and EasyOCR is not installed as fallback.")
+            bot_activity_logger.error(f"Tesseract failed: {e}")
+    
+    # 4. Try EasyOCR as last resort
+    if not extracted_text and EASYOCR_AVAILABLE:
+        try:
+            image_data_fallback = io.BytesIO(image_bytes)
+            extracted_text = await loop.run_in_executor(None, _sync_easyocr_image_to_text, image_data_fallback)
+            bot_activity_logger.info("Successfully extracted text using EasyOCR")
+        except Exception as e:
+            bot_activity_logger.error(f"EasyOCR failed: {e}")
+    
+    if not extracted_text:
+        raise Exception("All OCR methods failed!")
+    
+    # Clean the text for stock market alerts
+    cleaned_text = clean_ocr_text(extracted_text)
+    return cleaned_text
 
 
 # ── Legacy synchronous helpers (kept for backwards compatibility) ─────────────

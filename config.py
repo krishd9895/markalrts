@@ -18,6 +18,9 @@ MONITORED_CHANNELS = [int(x.strip()) for x in os.getenv("MONITORED_CHANNELS", ""
 MAX_LOG_AGE_HOURS = int(os.getenv("MAX_LOG_AGE_HOURS", 24))
 MAX_LOG_SIZE_BYTES = int(os.getenv("MAX_LOG_SIZE_BYTES", 2 * 1024 * 1024))  # 2MB default
 
+# External OCR service URL (optional)
+EXTERNAL_OCR_SERVICE_URL = os.getenv("EXTERNAL_OCR_SERVICE_URL","http://localhost:8181/api/ocr")
+
 
 # Global DB client references
 db_client = AsyncIOMotorClient(MONGO_URI)
