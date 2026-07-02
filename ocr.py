@@ -264,7 +264,7 @@ async def _sync_external_service_image_to_text(image_bytes):
     
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            files = {'file': ('image.jpg', image_bytes)}  # Use 'file' key as expected by your service
+            files = {'file': ('image.jpg', image_bytes)}  # Use 'file' key as expected by most external OCR services
             data = {'lang': 'eng'}  # Add language parameter
             response = await client.post(
                 EXTERNAL_OCR_SERVICE_URL,
