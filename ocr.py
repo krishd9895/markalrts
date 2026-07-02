@@ -26,11 +26,9 @@ except ImportError:
 # The scope needed to upload, read, and delete files for OCR
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
-# ── OCR-specific logger (file only, no terminal output) ──────────────────────
-# The actual handler is attached by logs.py via setup_ocr_logger().
-# We grab the named logger here; if logs.py hasn't run yet, messages
-# will still be captured once the handler is attached.
+# ── Loggers ──────────────────────
 ocr_logger = logging.getLogger("ocr_activity")
+bot_activity_logger = logging.getLogger("bot_activity")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -101,7 +99,7 @@ def _sync_test_credentials(creds):
 
 def _sync_image_to_text(service, image_data, image_name="Temp_OCR_File.jpg"):
     """Synchronous function to perform OCR (takes BytesIO or bytes)."""
-    # Force Google Drive to convert the image into a Google Doc (triggers OCR)
+    # Force Google Drive to convert the image to a Google Doc (triggers OCR)
     file_metadata = {
         'name': 'Temp_OCR_File',
         'mimeType': 'application/vnd.google-apps.document'
@@ -290,9 +288,9 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
         already_notified = False
 
     use_drive_api = True
+    drive_error = None
     
     if not creds:
-        ocr_logger.warning("No Google Drive credentials found in DB. Authentication required.")
         if bot and owners and not already_notified:
             for owner in owners:
                 await bot.send_message(
@@ -303,7 +301,7 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
                     f"2. Download its JSON key file\n"
                     f"3. Go to /settings → 📄 Google Drive Credentials → 📤 Upload Service Account Key (Recommended)\n"
                     f"4. Upload the JSON key file\n"
-                    f"5. Share your Google Drive with the service account's email address (will be shown after upload)\n\n"
+                    f"5. Share your Google Drive with the service account email (found in the JSON file)\n\n"
                     f"Or, for OAuth 2.0 (requires token refreshes):\n"
                     f"1. Upload your credentials.json via /settings → 📄 Google Drive Credentials → 📤 Upload OAuth credentials.json\n"
                     f"2. Generate a new token.json file locally by running the authentication flow\n"
@@ -329,7 +327,6 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
                 {"_id": "google_drive_creds"},
                 {"$set": {"already_notified_auth_issue": False}}
             )
-            ocr_logger.info("New credentials obtained and saved to DB.")
         else:
             use_drive_api = False
 
@@ -337,7 +334,6 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
         # Only check validity and refresh for OAuth credentials, not service accounts
         if creds.expired and creds.refresh_token:
             try:
-                ocr_logger.info("Access token expired. Refreshing...")
                 creds.refresh(Request())
                 token_data = json.loads(creds.to_json())
                 await save_credentials_to_db(db, token_data)
@@ -346,9 +342,8 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
                     {"_id": "google_drive_creds"},
                     {"$set": {"already_notified_auth_issue": False}}
                 )
-                ocr_logger.info("Token refreshed successfully.")
             except Exception as e:
-                ocr_logger.error(f"Token refresh failed: {e}")
+                bot_activity_logger.error(f"Google Drive token refresh failed: {e}")
                 if bot and owners and not already_notified:
                     for owner in owners:
                         await bot.send_message(
@@ -359,7 +354,7 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
                             f"2. Download its JSON key file\n"
                             f"3. Go to /settings → 📄 Google Drive Credentials → 📤 Upload Service Account Key (Recommended)\n"
                             f"4. Upload the JSON key file\n"
-                            f"5. Share your Google Drive with the service account's email address (will be shown after upload)\n\n"
+                            f"5. Share your Google Drive with the service account email (found in the JSON file)\n\n"
                             f"Or, to continue using OAuth 2.0:\n"
                             f"1. Generate a new token.json file locally by running the authentication flow\n"
                             f"2. Go to /settings → 📄 Google Drive Credentials → 📤 Upload OAuth token.json\n"
@@ -373,7 +368,6 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
                     )
                 use_drive_api = False
         else:
-            ocr_logger.warning("Credentials invalid and no refresh token. Re-authenticating...")
             if bot and owners and not already_notified:
                 for owner in owners:
                     await bot.send_message(
@@ -384,7 +378,7 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
                         f"2. Download its JSON key file\n"
                         f"3. Go to /settings → 📄 Google Drive Credentials → 📤 Upload Service Account Key (Recommended)\n"
                         f"4. Upload the JSON key file\n"
-                        f"5. Share your Google Drive with the service account's email address (will be shown after upload)\n\n"
+                        f"5. Share your Google Drive with the service account email (found in the JSON file)\n\n"
                         f"Or, for OAuth 2.0:\n"
                         f"1. Make sure you have uploaded credentials.json via /settings → 📄 Google Drive Credentials → 📤 Upload OAuth credentials.json\n"
                         f"2. Generate a new token.json file locally by running the authentication flow\n"
@@ -410,38 +404,36 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
                     {"_id": "google_drive_creds"},
                     {"$set": {"already_notified_auth_issue": False}}
                 )
-                ocr_logger.info("Re-authentication complete. New credentials saved.")
             else:
                 use_drive_api = False
 
     # Try Drive API first
+    extracted_text = None
     if use_drive_api:
         try:
-            # Reset image_data pointer
+            # Reset image data pointer
             image_data.seek(0)
             service = await loop.run_in_executor(None, _sync_get_drive_service, creds)
             extracted_text = await loop.run_in_executor(
                 None, partial(_sync_image_to_text, service, image_data, image_name)
             )
-            ocr_logger.info("Successfully extracted text using Google Drive API")
             return extracted_text
         except Exception as e:
-            ocr_logger.warning(f"Google Drive API failed: {e}. Trying EasyOCR fallback...")
+            drive_error = str(e)
+            bot_activity_logger.warning(f"Google Drive API failed: {e}")
             # Fall through to EasyOCR
     
     # Try EasyOCR fallback
     if EASYOCR_AVAILABLE:
         try:
-            ocr_logger.info("Using EasyOCR fallback for OCR")
             image_data_fallback = io.BytesIO(image_bytes)
             extracted_text = await loop.run_in_executor(
                 None, _sync_easyocr_image_to_text, image_data_fallback
             )
-            ocr_logger.info("Successfully extracted text using EasyOCR fallback")
             return extracted_text
         except Exception as e:
-            ocr_logger.error(f"EasyOCR fallback also failed: {e}")
-            raise Exception(f"Both Google Drive API and EasyOCR failed. Drive error: {str(e) if use_drive_api else 'No credentials'}, EasyOCR error: {str(e)}")
+            bot_activity_logger.error(f"EasyOCR fallback failed: {e}")
+            raise Exception(f"Both Google Drive API and EasyOCR failed. Drive error: {drive_error if use_drive_api else 'No credentials'}, EasyOCR error: {str(e)}")
     else:
         raise Exception("Google Drive API failed and EasyOCR is not installed as fallback.")
 
@@ -470,7 +462,6 @@ def image_to_text_sync(image_path):
         raise FileNotFoundError(f"Could not find the image file: {image_path}")
 
     service = get_drive_service()
-    ocr_logger.info(f"[sync] Uploading '{image_path}' to Google Drive...")
 
     file_metadata = {
         'name': 'Temp_OCR_File',
@@ -486,7 +477,6 @@ def image_to_text_sync(image_path):
     ).execute()
 
     file_id = uploaded_file.get('id')
-    ocr_logger.info(f"[sync] Processing OCR (file_id={file_id})...")
 
     request = service.files().export_media(fileId=file_id, mimeType='text/plain')
 
@@ -499,7 +489,6 @@ def image_to_text_sync(image_path):
     extracted_text = fh.getvalue().decode('utf-8')
 
     service.files().delete(fileId=file_id).execute()
-    ocr_logger.info("[sync] OCR complete. Temporary Drive file deleted.")
 
     return extracted_text
 
@@ -508,8 +497,8 @@ if __name__ == '__main__':
     TARGET_IMAGE = 'receipt.jpg'
     try:
         text = image_to_text_sync(TARGET_IMAGE)
-        ocr_logger.info("\n--- EXTRACTED TEXT ---")
-        ocr_logger.info(text)
-        ocr_logger.info("----------------------")
+        print("\n--- EXTRACTED TEXT ---")
+        print(text)
+        print("----------------------")
     except Exception as e:
-        ocr_logger.error(f"Error: {e}")
+        print(f"Error: {e}")

@@ -255,7 +255,6 @@ async def save_ocr_result_to_db(
         {"$set": ocr_doc},
         upsert=True
     )
-    ocr_logger.info(f"Saved OCR result for image {deep_link} to DB (hash={image_hash[:10]}...)")
 
 def extract_real_filename(original_message, fallback_entity_name: str) -> str:
     """
@@ -2302,26 +2301,17 @@ async def incoming_stream_pipeline(event: events.NewMessage.Event):
                     if cached_result:
                         ocr_text = cached_result.get("extracted_text")
                         logger.info(f"Using cached OCR for image {deep_link} (hash={image_hash[:10]}...)")
-                        ocr_logger.info(f"════════════════════════════════════════════════════════════")
-                        ocr_logger.info(f"📷 Image: {deep_link}")
-                        ocr_logger.info(f"✅ Using CACHED OCR (REAL-TIME)")
-                        ocr_logger.info(f"   Match type: {cached_result.get('match_type')}")
-                        ocr_logger.info(f"   Matched entities: {cached_result.get('matched_entities')}")
-                        ocr_logger.info(f"   Extracted text: {ocr_text[:200]}...")
                     else:
                         # No cache — run OCR
                         ocr_text = await image_to_text(db, photo_bytes, bot, OWNERS)
                         logger.info(f"OCR extracted text from image: {ocr_text[:200]}...")
                         channel_logger.info(f"[OCR] Extracted text from image: {ocr_text[:200]}...")
-                        ocr_logger.info(f"════════════════════════════════════════════════════════════")
-                        ocr_logger.info(f"📷 Image: {deep_link}")
-                        ocr_logger.info(f"🔍 Running NEW OCR (REAL-TIME)")
                     
                     # We'll save to cache after we run the final filter
             except Exception as e:
                 logger.error(f"Failed to OCR image: {e}")
                 channel_logger.error(f"[OCR] Failed to OCR image: {e}")
-                ocr_logger.error(f"❌ Failed to OCR real-time image {deep_link}: {e}")
+                bot_activity_logger.error(f"❌ Failed to OCR real-time image {deep_link}: {e}")
         elif has_photo and text_excluded and event.chat_id in ocr_channel_ids:
             channel_logger.info(f"[LIVE SCAN] Skipping OCR for message {event.id} - caption/text has exclusions")
 
@@ -2367,17 +2357,6 @@ async def incoming_stream_pipeline(event: events.NewMessage.Event):
                 entities,
                 is_matched
             )
-            ocr_logger.info(f"════════════════════════════════════════════════════════════")
-            ocr_logger.info(f"📷 Image: {deep_link}")
-            if is_matched:
-                ocr_logger.info(f"✅ MATCH FOUND")
-                ocr_logger.info(f"   Match type: {match_type}")
-                ocr_logger.info(f"   Matched entities: {', '.join(entities)}")
-                ocr_logger.info(f"   Extracted text: {ocr_text[:200]}...")
-            else:
-                ocr_logger.info(f"❌ No match found")
-                ocr_logger.info(f"   Extracted text: {ocr_text[:200]}...")
-            ocr_logger.info(f"════════════════════════════════════════════════════════════\n")
         
         if not is_matched:
             return
@@ -2661,8 +2640,7 @@ async def scan_channels_for_last_24h_portfolio_messages():
                 channel_id, 
                 limit=max_messages_per_channel,
                 reverse=False,  # False = most recent first (default)
-                offset_date=now_ist,  # Start from now and go back
-                chunk_size=100  # Fetch 100 messages per API call to reduce round trips
+                offset_date=now_ist  # Start from now and go back
             ):
                 messages_scanned += 1
                 
@@ -2916,12 +2894,7 @@ async def scan_channels_for_last_24h_portfolio_messages():
                         ocr_text = cached_result.get("extracted_text")
                         msg["ocr_text"] = ocr_text
                         bot_activity_logger.info(f"  Using cached OCR result for {msg['deep_link']} (hash={image_hash[:10]}...)")
-                        ocr_logger.info(f"════════════════════════════════════════════════════════════")
-                        ocr_logger.info(f"📷 Image: {msg['deep_link']}")
-                        ocr_logger.info(f"✅ Using CACHED OCR")
-                        ocr_logger.info(f"   Match type: {cached_result.get('match_type')}")
-                        ocr_logger.info(f"   Matched entities: {cached_result.get('matched_entities')}")
-                        ocr_logger.info(f"   Extracted text: {ocr_text[:200]}...")
+
                         
                         # Re-run filter just in case portfolio/macro keywords changed
                         combined_with_ocr = msg["text"] or ""
@@ -2949,9 +2922,6 @@ async def scan_channels_for_last_24h_portfolio_messages():
                     else:
                         # No cached result — run OCR
                         bot_activity_logger.info(f"  No cached OCR result, running OCR on {msg['deep_link']}")
-                        ocr_logger.info(f"════════════════════════════════════════════════════════════")
-                        ocr_logger.info(f"📷 Image: {msg['deep_link']}")
-                        ocr_logger.info(f"🔍 Running NEW OCR")
                         ocr_text = await image_to_text(db, photo_bytes, bot, OWNERS)
                         msg["ocr_text"] = ocr_text
                         bot_activity_logger.info(f"  OCR done: {ocr_text[:150]}...")
@@ -3005,18 +2975,11 @@ async def scan_channels_for_last_24h_portfolio_messages():
                         msg["text_matched"] = True  # now it matched via OCR
                         bot_activity_logger.info(f"  OCR match: {match_type} — {', '.join(entities)}")
                         channel_logger.info(f"[MATCHED VIA OCR (SCAN)] {match_type} — {', '.join(entities)}")
-                        ocr_logger.info(f"✅ MATCH FOUND")
-                        ocr_logger.info(f"   Match type: {match_type}")
-                        ocr_logger.info(f"   Matched entities: {', '.join(entities)}")
-                        ocr_logger.info(f"   Extracted text: {ocr_text[:200]}...")
-                        ocr_logger.info(f"════════════════════════════════════════════════════════════\n")
                     else:
                         # Still no match even after OCR — mark for removal
                         msg["ocr_no_match"] = True
                         bot_activity_logger.info(f"  Still no match after OCR — will exclude from results")
                         channel_logger.info(f"[FILTERED VIA OCR (SCAN)] No match even after OCR: {msg['deep_link']}")
-                        ocr_logger.info(f"❌ No match found")
-                        ocr_logger.info(f"════════════════════════════════════════════════════════════\n")
                     
                     if send_as_file and is_matched:
                         # Build proper OCR entry in same format as last 24h news files
