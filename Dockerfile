@@ -21,6 +21,11 @@ RUN apt-get update && (apt-get install -y --no-install-recommends \
 # Copy requirements first for caching
 COPY requirements.txt requirements-ocr.txt ./
 
+# Retry + longer timeout to tolerate flaky/slow networks (e.g. read
+# timeouts talking to files.pythonhosted.org)
+ENV PIP_DEFAULT_TIMEOUT=100
+ENV PIP_RETRIES=5
+
 # Install core Python dependencies (required)
 RUN pip install --no-cache-dir -r requirements.txt
 
