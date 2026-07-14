@@ -1,0 +1,6 @@
+# Optional local OCR stack. If these fail to install (e.g. low-resource
+# machine, missing system image libs), the bot still runs fine -- it just
+# falls back to Google Drive OCR and/or EXTERNAL_OCR_SERVICE_URL instead of
+# local Tesseract/EasyOCR. See ocr.py for the fallback logic.
+Pillow
+pytesseract
