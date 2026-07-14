@@ -2,6 +2,9 @@ services:
   bot:
     build: .
     restart: unless-stopped
+    hostname: ${NODE_LABEL:-}
+    ports:
+      - "5090:5090"
     volumes:
       - ./.env:/app/.env:ro
       # Optional: Mount logs for persistence
