@@ -4,7 +4,6 @@ import json
 import logging
 import asyncio
 from functools import partial
-from PIL import Image
 import httpx
 
 from google.oauth2.credentials import Credentials
@@ -17,17 +16,31 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBa
 # Import config
 from config import EXTERNAL_OCR_SERVICE_URL
 
+# ── OPTIONAL LOCAL OCR STACK ────────────────────────────────────────────────
+# Pillow, Tesseract (pytesseract) and EasyOCR are all optional. On
+# low-resource machines, or when the system packages (tesseract-ocr, image
+# libs) failed to install, these imports simply fail and we fall back to
+# Google Drive / an external OCR service instead of crashing the whole bot.
+
+# Try to import Pillow first -- both local OCR backends need it to open images
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    Image = None
+    PIL_AVAILABLE = False
+
 # Try to import Tesseract for lightweight OCR as default local option
 try:
     import pytesseract
-    TESSERACT_AVAILABLE = True
+    TESSERACT_AVAILABLE = PIL_AVAILABLE
 except ImportError:
     TESSERACT_AVAILABLE = False
 
 # Try to import EasyOCR as backup local option
 try:
     import easyocr
-    EASYOCR_AVAILABLE = True
+    EASYOCR_AVAILABLE = PIL_AVAILABLE
     EASYOCR_READER = None
 except ImportError:
     EASYOCR_AVAILABLE = False
@@ -39,6 +52,14 @@ SCOPES = ['https://www.googleapis.com/auth/drive']
 # ── Loggers ──────────────────────
 ocr_logger = logging.getLogger("ocr_activity")
 bot_activity_logger = logging.getLogger("bot_activity")
+
+if not TESSERACT_AVAILABLE and not EASYOCR_AVAILABLE:
+    ocr_logger.warning(
+        "No local OCR engine available (Pillow/Tesseract/EasyOCR not installed, "
+        "or the system OCR packages failed to install on this machine). "
+        "Falling back to Google Drive and/or an external OCR service (if configured) "
+        "for image text extraction; local OCR is simply skipped."
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
