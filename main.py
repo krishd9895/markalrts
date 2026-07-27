@@ -184,7 +184,7 @@ async def init_db_defaults():
     except Exception:
         # Index doesn't exist, that's okay
         pass
-    await db["recent_news_hashes"].create_index("ts", expireAfterSeconds=43200)
+    await db["recent_news_hashes"].create_index("ts", expireAfterSeconds=86400)
 
     # TTL index: OCR results auto-expire after 24 hours
     try:
@@ -205,6 +205,16 @@ async def init_db_defaults():
     except Exception:
         pass
     await db["processed_messages"].create_index(["channel_id", "message_id"], unique=True)
+
+    # TTL index: sent_to_user_cache holds only messages actually delivered to owners; expires after 24 h
+    try:
+        await db["sent_to_user_cache"].drop_index("ts_1")
+    except Exception:
+        pass
+    await db["sent_to_user_cache"].create_index("ts", expireAfterSeconds=86400)
+
+    # Trim the matched-message log file on startup so old entries don't accumulate
+    _trim_matched_log()
 
 
 async def is_message_processed(channel_id: int, message_id: int):
@@ -255,6 +265,178 @@ async def save_ocr_result_to_db(
         {"$set": ocr_doc},
         upsert=True
     )
+
+
+# =====================================================================
+# SCAN CACHE HELPERS
+# =====================================================================
+
+# =====================================================================
+# MATCHED MESSAGE LOG — FILE-BASED CACHE FOR /scan_old_messages
+# =====================================================================
+# All matched messages (live pipeline + manual scans) are written here
+# as JSON Lines so the next /scan_old_messages call can use them as a
+# cache without re-iterating Telegram history.
+#
+# MongoDB only tracks messages that were *actually sent to the user*
+# (sent_to_user_cache collection — see save_sent_to_user_db below).
+# =====================================================================
+
+MATCHED_LOG_DIR  = "matched_logs"
+MATCHED_LOG_PATH = os.path.join(MATCHED_LOG_DIR, "matched_messages.log")
+
+
+def _ensure_matched_log_dir():
+    os.makedirs(MATCHED_LOG_DIR, exist_ok=True)
+
+
+def _trim_matched_log(max_age_hours: int = 25):
+    """Remove entries older than *max_age_hours* to keep the file lean.
+    Called on startup and before each scan so stale data never accumulates.
+    """
+    if not os.path.exists(MATCHED_LOG_PATH):
+        return
+    cutoff = datetime.now(IST) - timedelta(hours=max_age_hours)
+    kept: list[str] = []
+    try:
+        with open(MATCHED_LOG_PATH, "r", encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(json.loads(raw).get("ts", ""))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=IST)
+                    if ts >= cutoff:
+                        kept.append(raw)
+                except Exception:
+                    kept.append(raw)  # keep unparseable lines rather than lose data
+        with open(MATCHED_LOG_PATH, "w", encoding="utf-8") as f:
+            f.write("\n".join(kept))
+            if kept:
+                f.write("\n")
+    except Exception as e:
+        logger.error(f"[MatchedLog] Failed to trim matched log: {e}")
+
+
+def log_matched_message(msg: dict, sent_to_user: bool = False):
+    """Append one matched-message record to the log file (JSON Lines).
+
+    Called whenever a message passes the two-tier filter.  The
+    *sent_to_user* flag is True only after a successful forward to the
+    owner; False entries represent matches that were dropped by dedup.
+    When the same (chat_id, message_id) is logged twice (once False,
+    once True), load_matched_log keeps the latest entry — so the
+    sent_to_user=True version wins.
+    """
+    _ensure_matched_log_dir()
+    date_val = msg.get("date")
+    ts_str = (
+        date_val.isoformat()
+        if isinstance(date_val, datetime)
+        else datetime.now(IST).isoformat()
+    )
+    entry = {
+        "ts":            ts_str,
+        "chat_id":       msg.get("chat_id"),
+        "message_id":    msg.get("message_id"),
+        "channel_label": msg.get("channel_label", ""),
+        "match_type":    msg.get("match_type", ""),
+        "entities":      msg.get("entities", []),
+        "text":          msg.get("text", ""),
+        "ocr_text":      msg.get("ocr_text", ""),
+        "pdf_filename":  msg.get("pdf_filename", ""),
+        "has_photo":     msg.get("has_photo", False),
+        "has_pdf":       msg.get("has_pdf", False),
+        "deep_link":     msg.get("deep_link", ""),
+        "msg_hash":      msg.get("msg_hash"),
+        "sent_to_user":  sent_to_user,
+    }
+    try:
+        with open(MATCHED_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+    except Exception as e:
+        logger.error(f"[MatchedLog] Failed to write entry: {e}")
+
+
+def load_matched_log(cutoff: datetime) -> list[dict]:
+    """Return all log entries with ts >= *cutoff* as dicts compatible with
+    the scan pipeline (includes a *date* key restored as a datetime).
+
+    When multiple entries exist for the same (chat_id, message_id) the
+    latest one wins — ensuring sent_to_user=True entries take precedence
+    over earlier sent_to_user=False entries for the same message.
+    """
+    _ensure_matched_log_dir()
+    if not os.path.exists(MATCHED_LOG_PATH):
+        return []
+    # Use a dict keyed by (chat_id, message_id) so later entries overwrite
+    # earlier ones for the same message.
+    by_key: dict = {}
+    try:
+        with open(MATCHED_LOG_PATH, "r", encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                    ts = datetime.fromisoformat(entry.get("ts", ""))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=IST)
+                    if ts < cutoff:
+                        continue
+                    entry["date"] = ts
+                    key = (entry.get("chat_id"), entry.get("message_id"))
+                    by_key[key] = entry
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.error(f"[MatchedLog] Failed to read log: {e}")
+    return list(by_key.values())
+
+
+async def save_sent_to_user_db(msg: dict):
+    """Persist a lightweight record of each message *actually delivered* to
+    owners in MongoDB (sent_to_user_cache, TTL 24 h).
+
+    This is the *only* scan-related data kept in MongoDB — everything else
+    (matched-but-not-sent) lives exclusively in the flat log file.
+    """
+    doc_id = f"{msg.get('chat_id')}_{msg.get('message_id')}"
+    try:
+        await db["sent_to_user_cache"].update_one(
+            {"_id": doc_id},
+            {"$set": {
+                "chat_id":       msg.get("chat_id"),
+                "message_id":    msg.get("message_id"),
+                "channel_label": msg.get("channel_label", ""),
+                "match_type":    msg.get("match_type", ""),
+                "entities":      msg.get("entities", []),
+                "deep_link":     msg.get("deep_link", ""),
+                "ts":            datetime.now(IST),
+            }},
+            upsert=True,
+        )
+    except Exception as e:
+        logger.error(f"[MatchedLog] Failed to save sent_to_user_cache: {e}")
+
+
+async def get_last_scan_time():
+    """Return the start timestamp of the most recent scan, or None if never run."""
+    doc = await db["config"].find_one({"_id": "last_scan_info"})
+    return doc.get("last_scan_at") if doc else None
+
+
+async def save_last_scan_time(ts: datetime):
+    """Persist the start time of the current scan so the next call knows where to resume."""
+    await db["config"].update_one(
+        {"_id": "last_scan_info"},
+        {"$set": {"last_scan_at": ts}},
+        upsert=True
+    )
+
 
 def extract_real_filename(original_message, fallback_entity_name: str) -> str:
     """
@@ -499,7 +681,7 @@ async def help_command(event):
         "/remove_channel [link/id] - Stop monitoring a channel\n"
         "/add_ocr_channel [link/id] - Add a new channel to OCR list\n"
         "/remove_ocr_channel [link/id] - Stop OCR on a channel\n"
-        "/scan_old_messages - Scan last 24h of monitored channels for missed messages\n"
+        "/scan_old_messages (or /som) - Scan last 24h of monitored channels for missed messages\n"
         "/logs - Send today's activity and channel logs\n"
         "/help - Show this command list\n\n"
         "**Settings Menu Features:**\n"
@@ -1921,14 +2103,14 @@ async def remove_channel_command(event: events.NewMessage.Event):
     except Exception as ex:
         await event.respond(f"❌ Could not resolve channel: `{ex}`")
 
-@bot.on(events.NewMessage(pattern=r"/scan_old_messages"))
+@bot.on(events.NewMessage(pattern=r"/(scan_old_messages|som)"))
 async def scan_old_messages_command(event: events.NewMessage.Event):
     if not is_authorized(event.sender_id):
         return
     await event.respond("🔍 Starting scan of monitored channels for last 24 hour messages...")
-    logger.info("Manual scan triggered via /scan_old_messages command.")
+    logger.info("Manual scan triggered via /scan_old_messages (/som) command.")
     bot_activity_logger.info("="*80)
-    bot_activity_logger.info("MANUAL SCAN TRIGGERED VIA /scan_old_messages COMMAND")
+    bot_activity_logger.info("MANUAL SCAN TRIGGERED VIA /scan_old_messages (/som) COMMAND")
     bot_activity_logger.info("="*80)
     try:
         await scan_channels_for_last_24h_portfolio_messages()
@@ -2290,25 +2472,34 @@ async def incoming_stream_pipeline(event: events.NewMessage.Event):
         if has_photo and not text_matched and not text_excluded and event.chat_id in ocr_channel_ids:
             sent_to_ocr = True
             channel_logger.info(f"[LIVE SCAN] Sending photo to OCR for message {event.id}")
+            ocr_logger.info("=" * 60)
+            ocr_logger.info(f"[LIVE] msg_id={event.id}  channel={chat_label}  link={deep_link}")
             try:
                 # Download image to memory — no disk write at all
                 photo_bytes = await event.download_media(file=bytes)
                 if photo_bytes:
                     image_hash = hashlib.sha256(photo_bytes).hexdigest()
+                    ocr_logger.info(f"[LIVE] image_size={len(photo_bytes):,} bytes  hash={image_hash[:16]}")
                     
                     # Check cache first
                     cached_result = await get_cached_ocr_result(image_hash)
                     if cached_result:
                         ocr_text = cached_result.get("extracted_text")
+                        ocr_logger.info(f"[LIVE] CACHE HIT — skipping OCR  clean_len={len(ocr_text or ''):,}")
+                        ocr_logger.info(f"[LIVE] text_preview={repr((ocr_text or '')[:120])}")
                         logger.info(f"Using cached OCR for image {deep_link} (hash={image_hash[:10]}...)")
                     else:
                         # No cache — run OCR
+                        ocr_logger.info(f"[LIVE] CACHE MISS — calling image_to_text()")
                         ocr_text = await image_to_text(db, photo_bytes, bot, OWNERS)
+                        ocr_logger.info(f"[LIVE] OCR DONE  clean_len={len(ocr_text or ''):,}")
+                        ocr_logger.info(f"[LIVE] text_preview={repr((ocr_text or '')[:120])}")
                         logger.info(f"OCR extracted text from image: {ocr_text[:200]}...")
                         channel_logger.info(f"[OCR] Extracted text from image: {ocr_text[:200]}...")
                     
                     # We'll save to cache after we run the final filter
             except Exception as e:
+                ocr_logger.info(f"[LIVE] ERROR — {e}")
                 logger.error(f"Failed to OCR image: {e}")
                 channel_logger.error(f"[OCR] Failed to OCR image: {e}")
                 bot_activity_logger.error(f"❌ Failed to OCR real-time image {deep_link}: {e}")
@@ -2399,6 +2590,26 @@ async def incoming_stream_pipeline(event: events.NewMessage.Event):
                 channel_logger.info(f"[FILTERED] Duplicate message (hash: {msg_hash[:16]}...)")
                 return
             await db["recent_news_hashes"].insert_one({"_id": msg_hash, "ts": datetime.now(IST)})
+
+        # Log this message to the matched-message log file and MongoDB sent cache.
+        # Dedup has passed so it will be delivered to the owner(s).
+        _live_msg_data = {
+            "chat_id":       event.chat_id,
+            "message_id":    event.id,
+            "channel_label": chat_label,
+            "match_type":    match_type,
+            "entities":      entities,
+            "text":          text_content,
+            "ocr_text":      ocr_text,
+            "pdf_filename":  pdf_filename,
+            "has_photo":     has_photo,
+            "has_pdf":       has_pdf,
+            "deep_link":     deep_link,
+            "msg_hash":      msg_hash,
+            "date":          event.date.astimezone(IST),
+        }
+        log_matched_message(_live_msg_data, sent_to_user=True)
+        await save_sent_to_user_db(_live_msg_data)
 
         # Now send to owners based on match type!
         for owner in OWNERS:
@@ -2563,7 +2774,37 @@ async def scan_channels_for_last_24h_portfolio_messages():
     now_ist = datetime.now(IST)
     cutoff_ist = now_ist - timedelta(days=1)
     bot_activity_logger.info(f"Cutoff time for messages: {cutoff_ist.strftime('%Y-%m-%d %H:%M:%S IST')}")
-    
+
+    # ── Scan cache: load previous matched results, compute incremental fetch window ──
+    last_scan_at = await get_last_scan_time()
+    if last_scan_at and last_scan_at.tzinfo is None:
+        last_scan_at = last_scan_at.replace(tzinfo=IST)
+
+    # Trim stale entries before loading so the cache is always ≤ 25 h old
+    _trim_matched_log()
+    cached_messages = load_matched_log(cutoff_ist)
+    cached_message_keys = {(m["chat_id"], m["message_id"]) for m in cached_messages}
+
+    bot_activity_logger.info(
+        f"Scan cache: {len(cached_messages)} cached match(es) within the last 24h. "
+        f"Last scan started at: {last_scan_at.strftime('%Y-%m-%d %H:%M:%S IST') if last_scan_at else 'never'}"
+    )
+
+    # Only fetch messages from Telegram that are NEWER than the last scan start time.
+    # This avoids re-iterating messages already processed; on first run fetch the full 24h window.
+    if last_scan_at and last_scan_at > cutoff_ist:
+        telegram_fetch_from = last_scan_at
+        bot_activity_logger.info(
+            f"Incremental Telegram fetch: requesting only messages after "
+            f"{telegram_fetch_from.strftime('%Y-%m-%d %H:%M:%S IST')}."
+        )
+    else:
+        telegram_fetch_from = cutoff_ist
+        bot_activity_logger.info("Full 24h Telegram fetch: no valid scan cache found.")
+
+    # Persist the current scan start time now so the next call knows where to resume
+    await save_last_scan_time(now_ist)
+
     config = await get_system_config()
     monitored_raw = config.get("monitored_channels", [])
     ocr_channels_raw = config.get("ocr_channels", [])
@@ -2669,16 +2910,27 @@ async def scan_channels_for_last_24h_portfolio_messages():
                     message_date_utc = message.date
                 message_date_ist = message_date_utc.astimezone(IST)
                 
-                # Check if message is older than cutoff
-                if message_date_ist < cutoff_ist:
+                # Stop iterating once we reach messages older than our fetch window.
+                # On an incremental scan this is last_scan_at; on a full scan it is the 24h cutoff.
+                if message_date_ist < telegram_fetch_from:
                     messages_beyond_cutoff += 1
                     if messages_beyond_cutoff >= 5:
-                        # If we've seen 5 messages in a row beyond cutoff, stop scanning this channel
-                        channel_logger.info(f"Stopping scan for {channel_label}: found 5+ messages beyond cutoff")
-                        bot_activity_logger.info(f"Stopping scan for {channel_label}: found 5+ messages beyond cutoff")
+                        channel_logger.info(
+                            f"Stopping scan for {channel_label}: 5+ messages older than "
+                            f"{telegram_fetch_from.strftime('%Y-%m-%d %H:%M IST')} (cache boundary)"
+                        )
+                        bot_activity_logger.info(
+                            f"Stopping scan for {channel_label}: reached cache boundary at "
+                            f"{telegram_fetch_from.strftime('%Y-%m-%d %H:%M:%S IST')}"
+                        )
                         break
                     continue
-                
+
+                # Skip if this message is already stored in the scan cache (matched in a previous run)
+                if (channel_id, message.id) in cached_message_keys:
+                    messages_skipped += 1
+                    continue
+
                 text_content = message.text or ""
                 pdf_filename = ""
                 
@@ -2847,6 +3099,88 @@ async def scan_channels_for_last_24h_portfolio_messages():
     # Finalize scan progress first
     await scan_progress.finalize_progress(f"✅ Channel scan complete!\n{len(all_matched_messages)} initial matches found.")
 
+    # ── INTERIM: Send text-matched results before OCR begins ─────────────────────
+    # Users get early visibility of text-only matches immediately after the text
+    # scan. OCR results are added in the final combined files sent at the end.
+    _deferred_count = len([m for m in all_matched_messages if m.get("needs_ocr")])
+    _text_only_matched = [m for m in all_matched_messages if not m.get("needs_ocr")]
+
+    # Merge cached + new text-only matches for the interim files (full 24h picture)
+    _interim_all = cached_messages + _text_only_matched
+    _interim_seen: set = set()
+    _interim_portfolio: list = []
+    _interim_macro: list = []
+    for _m in _interim_all:
+        _k = (_m["chat_id"], _m["message_id"])
+        if _k not in _interim_seen:
+            _interim_seen.add(_k)
+            if _m.get("match_type") == "Portfolio Stock":
+                _interim_portfolio.append(_m)
+            elif _m.get("match_type") == "Macro Economy":
+                _interim_macro.append(_m)
+
+    _now_interim_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+    _interim_portfolio_content = f"Text-Matched Portfolio News (Pre-OCR)\nGenerated on: {_now_interim_str}\n\n"
+    _interim_macro_content = f"Text-Matched Macro News (Pre-OCR)\nGenerated on: {_now_interim_str}\n\n"
+
+    for _idx, _msg in enumerate(_interim_portfolio, 1):
+        _interim_portfolio_content += f"--- Message {_idx} ---\n"
+        _interim_portfolio_content += f"Match Type: 📊 Portfolio Stock Match\n"
+        _interim_portfolio_content += f"Posted on: {_msg['date'].strftime('%Y-%m-%d %H:%M:%S IST')}\n"
+        _interim_portfolio_content += f"From Channel: {_msg['channel_label']}\n"
+        _interim_portfolio_content += f"Matched Entities: {', '.join(_msg.get('entities', []))}\n"
+        if _msg.get("text"):
+            _interim_portfolio_content += f"Content:\n{_msg['text']}\n"
+        if _msg.get("pdf_filename"):
+            _interim_portfolio_content += f"PDF Filename:\n{_msg['pdf_filename']}\n"
+        _interim_portfolio_content += "\n"
+
+    for _idx, _msg in enumerate(_interim_macro, 1):
+        _interim_macro_content += f"--- Message {_idx} ---\n"
+        _interim_macro_content += f"Match Type: 🌐 Macro Economy Match\n"
+        _interim_macro_content += f"Posted on: {_msg['date'].strftime('%Y-%m-%d %H:%M:%S IST')}\n"
+        _interim_macro_content += f"From Channel: {_msg['channel_label']}\n"
+        _interim_macro_content += f"Matched Entities: {', '.join(_msg.get('entities', []))}\n"
+        if _msg.get("text"):
+            _interim_macro_content += f"Content:\n{_msg['text']}\n"
+        if _msg.get("pdf_filename"):
+            _interim_macro_content += f"PDF Filename:\n{_msg['pdf_filename']}\n"
+        _interim_macro_content += "\n"
+
+    for owner in OWNERS:
+        try:
+            owner_entity = PeerUser(int(owner))
+            await bot.send_message(
+                owner_entity,
+                f"📄 **Text scan complete — interim results below**\n"
+                f"✅ Text matches: {len(_text_only_matched)}\n"
+                f"🖼️ Images queued for OCR: {_deferred_count}\n\n"
+                f"_Final combined files (text + OCR) will follow after the image scan._",
+                link_preview=False
+            )
+            # Interim Portfolio file
+            _ip_bytes = io.BytesIO(_interim_portfolio_content.encode("utf-8"))
+            _ip_bytes.name = f"Text_Portfolio_News_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}.txt"
+            await bot.send_file(
+                owner_entity,
+                _ip_bytes,
+                caption=f"📊 Text-Matched Portfolio News — {len(_interim_portfolio)} message(s) [pre-OCR]",
+                link_preview=False
+            )
+            # Interim Macro file
+            _im_bytes = io.BytesIO(_interim_macro_content.encode("utf-8"))
+            _im_bytes.name = f"Text_Macro_News_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}.txt"
+            await bot.send_file(
+                owner_entity,
+                _im_bytes,
+                caption=f"🌐 Text-Matched Macro News — {len(_interim_macro)} message(s) [pre-OCR]",
+                link_preview=False
+            )
+            bot_activity_logger.info(f"✓ Interim text results files sent to {owner}")
+        except Exception as e:
+            logger.error(f"Failed to send interim text results to {owner}: {e}")
+            bot_activity_logger.error(f"✗ Failed to send interim text results to {owner}: {e}")
+
     # ── PASS 2: Sequential OCR for deferred photo messages ──────────────────────
     # These are messages where text alone didn't match but a photo is present.
     # We process them one at a time to respect rate limits.
@@ -2867,6 +3201,8 @@ async def scan_channels_for_last_24h_portfolio_messages():
         bot_activity_logger.info(f"="*80)
         bot_activity_logger.info(f"PASS 2: Running OCR on {len(deferred_ocr_messages)} deferred photo message(s)")
         bot_activity_logger.info(f"="*80)
+        ocr_logger.info("=" * 60)
+        ocr_logger.info(f"[SCAN PASS 2 START] {len(deferred_ocr_messages)} image(s) to process")
 
         send_as_file = len(deferred_ocr_messages) > OCR_BATCH_THRESHOLD
         if send_as_file:
@@ -2881,21 +3217,25 @@ async def scan_channels_for_last_24h_portfolio_messages():
         for i, msg in enumerate(deferred_ocr_messages, 1):
             try:
                 bot_activity_logger.info(f"  [{i}/{len(deferred_ocr_messages)}] Processing photo in message {msg['message_id']} from {msg['channel_label']}")
+                ocr_logger.info("-" * 40)
+                ocr_logger.info(f"[SCAN {i}/{len(deferred_ocr_messages)}] msg_id={msg['message_id']}  channel={msg['channel_label']}  link={msg['deep_link']}")
                 original_message = await user.get_messages(msg['chat_id'], ids=msg['message_id'])
                 # Download to memory — no disk write
                 photo_bytes = await user.download_media(original_message, file=bytes)
                 if photo_bytes:
                     # Compute image hash for caching
                     image_hash = hashlib.sha256(photo_bytes).hexdigest()
+                    ocr_logger.info(f"[SCAN {i}] image_size={len(photo_bytes):,} bytes  hash={image_hash[:16]}")
                     
                     # Check cache first
                     cached_result = await get_cached_ocr_result(image_hash)
                     if cached_result:
                         ocr_text = cached_result.get("extracted_text")
                         msg["ocr_text"] = ocr_text
+                        ocr_logger.info(f"[SCAN {i}] CACHE HIT — skipping OCR  clean_len={len(ocr_text or ''):,}")
+                        ocr_logger.info(f"[SCAN {i}] text_preview={repr((ocr_text or '')[:120])}")
                         bot_activity_logger.info(f"  Using cached OCR result for {msg['deep_link']} (hash={image_hash[:10]}...)")
 
-                        
                         # Re-run filter just in case portfolio/macro keywords changed
                         combined_with_ocr = msg["text"] or ""
                         if msg.get("pdf_filename"):
@@ -2921,9 +3261,12 @@ async def scan_channels_for_last_24h_portfolio_messages():
                         )
                     else:
                         # No cached result — run OCR
+                        ocr_logger.info(f"[SCAN {i}] CACHE MISS — calling image_to_text()")
                         bot_activity_logger.info(f"  No cached OCR result, running OCR on {msg['deep_link']}")
                         ocr_text = await image_to_text(db, photo_bytes, bot, OWNERS)
                         msg["ocr_text"] = ocr_text
+                        ocr_logger.info(f"[SCAN {i}] OCR DONE  clean_len={len(ocr_text or ''):,}")
+                        ocr_logger.info(f"[SCAN {i}] text_preview={repr((ocr_text or '')[:120])}")
                         bot_activity_logger.info(f"  OCR done: {ocr_text[:150]}...")
                         channel_logger.info(f"[OCR (SCAN PASS 2)] {msg['deep_link']}: {ocr_text[:150]}...")
 
@@ -2959,6 +3302,12 @@ async def scan_channels_for_last_24h_portfolio_messages():
                     else:
                         ocr_no_match_count +=1
                     
+                    # Log filter result to OCR log
+                    if is_matched:
+                        ocr_logger.info(f"[SCAN {i}] FILTER → MATCHED  type={match_type}  entities={entities}")
+                    else:
+                        ocr_logger.info(f"[SCAN {i}] FILTER → NO MATCH")
+
                     # Update progress messages using our ProgressManager
                     await ocr_progress.update_progress(
                         "🔍 OCR in progress...",
@@ -3008,6 +3357,21 @@ async def scan_channels_for_last_24h_portfolio_messages():
 
         # Remove messages that failed to match even after OCR
         all_matched_messages = [m for m in all_matched_messages if not m.get("ocr_no_match")]
+
+        # ── Log new matches (with OCR text) to the matched-message log file ────
+        new_matches_for_log = [
+            m for m in all_matched_messages
+            if (m["chat_id"], m["message_id"]) not in cached_message_keys
+        ]
+        if new_matches_for_log:
+            for _m in new_matches_for_log:
+                log_matched_message(_m, sent_to_user=False)
+            bot_activity_logger.info(
+                f"Logged {len(new_matches_for_log)} new match(es) to matched log file "
+                f"({len(cached_messages)} were already in cache)."
+            )
+        else:
+            bot_activity_logger.info("No new matches to add to matched log.")
 
         # Finalize OCR progress
         await ocr_progress.finalize_progress(
@@ -3085,34 +3449,73 @@ async def scan_channels_for_last_24h_portfolio_messages():
             except Exception as e:
                 logger.error(f"Failed to send wait message to {owner}: {e}")
 
-    # Now separate messages to forward (apply hash checks to skip already processed)
+    # ── Log new text-only matches to the matched-message log file ────────────────
+    # The OCR path already logged inside the deferred_ocr_messages block above.
+    # For messages that needed no OCR (text-only matches), log them here.
+    text_only_new = [
+        m for m in all_matched_messages
+        if not m.get("needs_ocr") and (m["chat_id"], m["message_id"]) not in cached_message_keys
+    ]
+    if text_only_new:
+        for _m in text_only_new:
+            log_matched_message(_m, sent_to_user=False)
+        bot_activity_logger.info(
+            f"Logged {len(text_only_new)} text-only new match(es) to matched log file."
+        )
+
+    # ── Merge cached + new matches for summary text file output ──────────────────
+    # Cached messages were already forwarded in a previous run; include them in the
+    # text files so every /scan_old_messages always shows the full 24h picture,
+    # but do NOT re-forward them.
+    _all_for_files = cached_messages + all_matched_messages
+    _seen_file_keys: set = set()
+    all_matched_for_files: list = []
+    for _m in _all_for_files:
+        _k = (_m["chat_id"], _m["message_id"])
+        if _k not in _seen_file_keys:
+            _seen_file_keys.add(_k)
+            all_matched_for_files.append(_m)
+    bot_activity_logger.info(
+        f"Merged output: {len(all_matched_for_files)} total match(es) "
+        f"({len(cached_messages)} from cache + {len(all_matched_messages)} new from Telegram)."
+    )
+
+    # ── Forward only new PORTFOLIO messages (Macro goes into text files only) ───────
+    # recent_news_hashes (24h TTL) covers the full 24h window.
+    # cached_message_keys covers the full 24h window so nothing gets re-sent.
+    # Macro Economy messages are intentionally excluded from forwarding — they
+    # are captured in the summary text file but never sent as individual messages.
     messages_to_forward = []
     seen_hashes_in_scan = set()
-    for msg in all_matched_messages:
+    for msg in all_matched_messages:   # new messages only — cached ones are excluded by design
+        # Macro messages: included in text files only, never forwarded individually
+        if msg["match_type"] == "Macro Economy":
+            bot_activity_logger.info(f"[MACRO SKIP] Not forwarding macro message (text file only): {msg['deep_link']}")
+            continue
         msg_hash = msg.get('msg_hash')
         if msg_hash:
             # Check if we've already seen this hash in this scan
             if msg_hash in seen_hashes_in_scan:
                 bot_activity_logger.info(f"[SKIPPED (SCAN)] Duplicate in scan: {msg['deep_link']}")
                 continue
-            # Check if we've already processed this message before
+            # Check if we've already processed this message before (12h hash window)
             if await db["recent_news_hashes"].find_one({"_id": msg_hash}):
                 channel_logger.info(f"[FILTERED (SCAN)] Already processed message - Skipping forwarding")
                 bot_activity_logger.info(f"[SKIPPED] Already processed: {msg['deep_link']}")
                 continue
             seen_hashes_in_scan.add(msg_hash)
         messages_to_forward.append(msg)
-    
-    # For final text files: use all unique matched messages (deduplicated within the scan, including OCR)
+
+    # For final text files: use the full merged set (cached + new), deduped
     unique_for_final_text_files = []
     seen_hashes_for_final_text = set()
-    for msg in all_matched_messages:
+    for msg in all_matched_for_files:
         msg_hash = msg.get('msg_hash') or str(msg['message_id']) + str(msg['chat_id'])
         if msg_hash not in seen_hashes_for_final_text:
             seen_hashes_for_final_text.add(msg_hash)
             unique_for_final_text_files.append(msg)
-    
-    bot_activity_logger.info(f"Total matched messages: {len(all_matched_messages)}, unique for final text files: {len(unique_for_final_text_files)}, to forward: {len(messages_to_forward)}")
+
+    bot_activity_logger.info(f"Total matched messages: {len(all_matched_messages)} new + {len(cached_messages)} cached, unique for final text files: {len(unique_for_final_text_files)}, to forward: {len(messages_to_forward)}")
     
     # Split into portfolio and macro for final text files
     final_portfolio_messages = [m for m in unique_for_final_text_files if m["match_type"] == "Portfolio Stock"]
@@ -3203,83 +3606,78 @@ async def scan_channels_for_last_24h_portfolio_messages():
                 bot_activity_logger.info(f"[{idx}/{len(messages_to_forward)}] Processing message: {msg['deep_link']} (Entities: {', '.join(msg['entities'])}, Type: {msg['match_type']}, date: {msg['date'].strftime('%Y-%m-%d %H:%M:%S IST')})")
                 
                 try:
-                    if msg["match_type"] == "Macro Economy":
-                        # Skip sending individual macro links, just log
-                        bot_activity_logger.info(f"  Skipping macro message (only included in text file): {msg['deep_link']}")
-                    else:
-                        match_label = "📊 Portfolio Stock"
-                        header = (
-                            f"📜 **Last 24 Hour {match_label} Match**\n"
-                            f"Matched: **{', '.join(msg['entities'])}**\n"
-                            f"From: {msg['channel_label']}\n"
-                            f"Date: {msg['date'].strftime('%Y-%m-%d %H:%M:%S IST')}\n"
-                        )
-                        
-                        # Handle photo if present
-                        if msg.get("has_photo") and user:
-                            try:
-                                bot_activity_logger.info(f"  Processing photo from message {msg['message_id']}...")
-                                original_message = await user.get_messages(msg['chat_id'], ids=msg['message_id'])
-                                photo_file = await user.download_media(original_message, file=bytes)
-                                if photo_file:
-                                    photo_bytesio = io.BytesIO(photo_file)
-                                    photo_bytesio.name = f"photo_{msg['message_id']}.jpg"
-                                    caption = header + f"Source: {msg['deep_link']}"
-                                    if msg.get("text"):
-                                        caption += f"\n\n{msg['text']}"
-                                    if msg.get("ocr_text"):
-                                        caption += f"\n\n--- OCR Text ---\n{msg['ocr_text']}"
-                                    await bot.send_file(
-                                        owner_entity,
-                                        photo_bytesio,
-                                        caption=caption,
-                                        link_preview=False
-                                    )
-                                    bot_activity_logger.info(f"  ✓ Photo sent to {owner}")
-                                    continue
-                            except Exception as photo_err:
-                                logger.error(f"Failed to send photo: {photo_err}")
-                                bot_activity_logger.error(f"  ✗ Failed to send photo: {photo_err}")
-                        
-                        # Handle PDF if present
-                        if msg.get("has_pdf") and user:
-                            try:
-                                bot_activity_logger.info(f"  Processing PDF from message {msg['message_id']}...")
-                                original_message = await user.get_messages(msg["chat_id"], ids=msg["message_id"])
-                                pdf_filename = extract_real_filename(original_message, msg['entities'][0])
-                                pdf_file = await user.download_media(original_message, file=bytes)
-                                if pdf_file:
-                                    pdf_bytesio = io.BytesIO(pdf_file)
-                                    pdf_bytesio.name = pdf_filename
-                                    caption = header + f"Source: {msg['deep_link']}"
-                                    if msg.get("text"):
-                                        caption += f"\n\n{msg['text']}"
-                                    if msg.get("pdf_filename"):
-                                        caption += f"\n\n--- PDF Filename ---\n{msg['pdf_filename']}"
-                                    await bot.send_file(
-                                        owner_entity,
-                                        pdf_bytesio,
-                                        caption=caption,
-                                        link_preview=False
-                                    )
-                                    bot_activity_logger.info(f"  ✓ PDF sent to {owner} with filename: {pdf_filename}")
-                                    continue
-                            except Exception as pdf_err:
-                                logger.error(f"Failed to send PDF: {pdf_err}")
-                                bot_activity_logger.error(f"  ✗ Failed to send PDF: {pdf_err}")
-                        
-                        # Handle text only
-                        full_message = header + f"Source: {msg['deep_link']}"
-                        if msg.get("text"):
-                            full_message += f"\n\n{msg['text']}"
-                        await bot.send_message(owner_entity, full_message, link_preview=False)
-                        bot_activity_logger.info(f"  ✓ Text sent to {owner}")
+                    # All messages in this list are Portfolio Stock — macro is excluded before this loop
+                    header = (
+                        f"📜 **Last 24 Hour 📊 Portfolio Stock Match**\n"
+                        f"Matched: **{', '.join(msg['entities'])}**\n"
+                        f"From: {msg['channel_label']}\n"
+                        f"Date: {msg['date'].strftime('%Y-%m-%d %H:%M:%S IST')}\n"
+                    )
+
+                    # Handle photo if present
+                    if msg.get("has_photo") and user:
+                        try:
+                            bot_activity_logger.info(f"  Processing photo from message {msg['message_id']}...")
+                            original_message = await user.get_messages(msg['chat_id'], ids=msg['message_id'])
+                            photo_file = await user.download_media(original_message, file=bytes)
+                            if photo_file:
+                                photo_bytesio = io.BytesIO(photo_file)
+                                photo_bytesio.name = f"photo_{msg['message_id']}.jpg"
+                                caption = header + f"Source: {msg['deep_link']}"
+                                if msg.get("text"):
+                                    caption += f"\n\n{msg['text']}"
+                                if msg.get("ocr_text"):
+                                    caption += f"\n\n--- OCR Text ---\n{msg['ocr_text']}"
+                                await bot.send_file(
+                                    owner_entity,
+                                    photo_bytesio,
+                                    caption=caption,
+                                    link_preview=False
+                                )
+                                bot_activity_logger.info(f"  ✓ Photo sent to {owner}")
+                                continue
+                        except Exception as photo_err:
+                            logger.error(f"Failed to send photo: {photo_err}")
+                            bot_activity_logger.error(f"  ✗ Failed to send photo: {photo_err}")
+
+                    # Handle PDF if present
+                    if msg.get("has_pdf") and user:
+                        try:
+                            bot_activity_logger.info(f"  Processing PDF from message {msg['message_id']}...")
+                            original_message = await user.get_messages(msg["chat_id"], ids=msg["message_id"])
+                            pdf_filename = extract_real_filename(original_message, msg['entities'][0])
+                            pdf_file = await user.download_media(original_message, file=bytes)
+                            if pdf_file:
+                                pdf_bytesio = io.BytesIO(pdf_file)
+                                pdf_bytesio.name = pdf_filename
+                                caption = header + f"Source: {msg['deep_link']}"
+                                if msg.get("text"):
+                                    caption += f"\n\n{msg['text']}"
+                                if msg.get("pdf_filename"):
+                                    caption += f"\n\n--- PDF Filename ---\n{msg['pdf_filename']}"
+                                await bot.send_file(
+                                    owner_entity,
+                                    pdf_bytesio,
+                                    caption=caption,
+                                    link_preview=False
+                                )
+                                bot_activity_logger.info(f"  ✓ PDF sent to {owner} with filename: {pdf_filename}")
+                                continue
+                        except Exception as pdf_err:
+                            logger.error(f"Failed to send PDF: {pdf_err}")
+                            bot_activity_logger.error(f"  ✗ Failed to send PDF: {pdf_err}")
+
+                    # Handle text only
+                    full_message = header + f"Source: {msg['deep_link']}"
+                    if msg.get("text"):
+                        full_message += f"\n\n{msg['text']}"
+                    await bot.send_message(owner_entity, full_message, link_preview=False)
+                    bot_activity_logger.info(f"  ✓ Text sent to {owner}")
                 except Exception as e:
                     logger.error(f"Failed to send message to {owner}: {e}")
                     bot_activity_logger.error(f"  ✗ Failed to send to {owner}: {e}")
-                
-                if msg["match_type"] == "Portfolio Stock":
-                    bot_activity_logger.info(f"  ✓ Message [{idx}] sent successfully")
+
+                bot_activity_logger.info(f"  ✓ Message [{idx}] sent successfully")
             
             # Send final text files
             # Send final Portfolio News file
@@ -3314,7 +3712,7 @@ async def scan_channels_for_last_24h_portfolio_messages():
             import traceback
             bot_activity_logger.error(f"Stack trace: {traceback.format_exc()}")
     
-    # Mark all forwarded messages as processed
+    # Mark all forwarded messages as processed and record them as sent
     for msg in messages_to_forward:
         if msg['msg_hash']:
             await db["recent_news_hashes"].update_one(
@@ -3322,6 +3720,9 @@ async def scan_channels_for_last_24h_portfolio_messages():
                 {"$set": {"_id": msg['msg_hash'], "ts": datetime.now(IST)}},
                 upsert=True
             )
+        # Update matched log to sent_to_user=True and persist to MongoDB
+        log_matched_message(msg, sent_to_user=True)
+        await save_sent_to_user_db(msg)
     
     bot_activity_logger.info("Scan and forwarding complete!")
 

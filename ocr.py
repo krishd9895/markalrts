@@ -14,37 +14,37 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
 
 # Import config
-from config import EXTERNAL_OCR_SERVICE_URL
+from config import EXTERNAL_OCR_SERVICE_URL, DEFAULT_OCR_METHOD, INSTALL_TESSERACT
 
 # ── OPTIONAL LOCAL OCR STACK ────────────────────────────────────────────────
-# Pillow, Tesseract (pytesseract) and EasyOCR are all optional. On
-# low-resource machines, or when the system packages (tesseract-ocr, image
-# libs) failed to install, these imports simply fail and we fall back to
-# Google Drive / an external OCR service instead of crashing the whole bot.
+# Pillow and Tesseract (pytesseract) are optional. On low-resource machines,
+# or when the system package tesseract-ocr is not installed, these imports
+# simply fail and we fall back to Google Drive / an external OCR service
+# instead of crashing the whole bot.
+# EasyOCR is not used in this repo.
 
-# Try to import Pillow first -- both local OCR backends need it to open images
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-except ImportError:
-    Image = None
-    PIL_AVAILABLE = False
+# Both Pillow and Tesseract are only imported when INSTALL_TESSERACT is enabled.
+# There is no point loading Pillow if Tesseract will never be used — it just
+# wastes memory and storage on resource-constrained machines.
+PIL_AVAILABLE = False
+TESSERACT_AVAILABLE = False
+Image = None  # keep the name available so the rest of the module can reference it safely
 
-# Try to import Tesseract for lightweight OCR as default local option
-try:
-    import pytesseract
-    TESSERACT_AVAILABLE = PIL_AVAILABLE
-except ImportError:
-    TESSERACT_AVAILABLE = False
+if INSTALL_TESSERACT:
+    # Try to import Pillow first -- needed to open images for local OCR
+    try:
+        from PIL import Image
+        PIL_AVAILABLE = True
+    except ImportError:
+        PIL_AVAILABLE = False
 
-# Try to import EasyOCR as backup local option
-try:
-    import easyocr
-    EASYOCR_AVAILABLE = PIL_AVAILABLE
-    EASYOCR_READER = None
-except ImportError:
-    EASYOCR_AVAILABLE = False
-    EASYOCR_READER = None
+    # Try to import Tesseract -- only useful when Pillow is also available
+    if PIL_AVAILABLE:
+        try:
+            import pytesseract
+            TESSERACT_AVAILABLE = True
+        except ImportError:
+            TESSERACT_AVAILABLE = False
 
 # The scope needed to upload, read, and delete files for OCR
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -53,13 +53,18 @@ SCOPES = ['https://www.googleapis.com/auth/drive']
 ocr_logger = logging.getLogger("ocr_activity")
 bot_activity_logger = logging.getLogger("bot_activity")
 
-if not TESSERACT_AVAILABLE and not EASYOCR_AVAILABLE:
-    ocr_logger.warning(
-        "No local OCR engine available (Pillow/Tesseract/EasyOCR not installed, "
-        "or the system OCR packages failed to install on this machine). "
-        "Falling back to Google Drive and/or an external OCR service (if configured) "
-        "for image text extraction; local OCR is simply skipped."
-    )
+if not TESSERACT_AVAILABLE:
+    if INSTALL_TESSERACT:
+        ocr_logger.warning(
+            "Tesseract is not available (pytesseract or Pillow failed to import, "
+            "or the system package tesseract-ocr is not installed). "
+            "Falling back to Google Drive and/or an external OCR service (if configured)."
+        )
+    else:
+        ocr_logger.info(
+            "Tesseract is disabled via INSTALL_TESSERACT=false. "
+            "Using external OCR service and/or Google Drive API."
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -211,30 +216,6 @@ def _sync_tesseract_image_to_text(image_data):
     return extracted_text
 
 
-def _sync_easyocr_image_to_text(image_data):
-    """Synchronous function to perform OCR using EasyOCR as backup."""
-    global EASYOCR_READER
-    
-    if not EASYOCR_AVAILABLE:
-        raise ImportError("EasyOCR is not installed")
-    
-    # Initialize reader if not already initialized
-    if EASYOCR_READER is None:
-        # Use English by default, can be expanded to other languages
-        EASYOCR_READER = easyocr.Reader(['en'], gpu=False)  # GPU=False for Docker compatibility
-    
-    # Load image from BytesIO
-    image = Image.open(image_data)
-    
-    # Perform OCR
-    results = EASYOCR_READER.readtext(image, detail=0)
-    
-    # Join results into a single string
-    extracted_text = '\n'.join(results)
-    
-    return extracted_text
-
-
 def clean_ocr_text(text):
     """Clean OCR text specifically for stock market alerts with aggressive noise removal"""
     import re
@@ -367,11 +348,12 @@ async def test_google_credentials(db):
 
 
 async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_OCR_File.jpg"):
-    """Async wrapper for OCR with multiple fallbacks:
-    1. External service (if configured)
-    2. Google Drive API
-    3. Tesseract
-    4. EasyOCR
+    """Async wrapper for OCR with multiple fallbacks.
+
+    The method attempted first is controlled by DEFAULT_OCR_METHOD (env var).
+    The remaining methods are tried as fallbacks in this fixed order:
+      external → google_drive → tesseract
+    (EasyOCR is not used in this repo.)
     """
     # Reject file paths — bytes only to avoid disk usage
     if isinstance(image_data, str):
@@ -405,19 +387,27 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
         )
         already_notified = False
     
-    # ── Try external OCR in order: external service → Google Drive → Tesseract → EasyOCR
+    # ── Build the ordered fallback list from DEFAULT_OCR_METHOD ──────────────
+    # The preferred method goes first; remaining methods follow in their fixed
+    # order: external → google_drive → tesseract.
+    _ALL_METHODS = ["external", "google_drive", "tesseract"]
+    _preferred = DEFAULT_OCR_METHOD.strip().lower()
+    if _preferred not in _ALL_METHODS:
+        bot_activity_logger.warning(
+            f"Unknown DEFAULT_OCR_METHOD '{_preferred}'. "
+            f"Falling back to default order: {_ALL_METHODS}"
+        )
+        _preferred = _ALL_METHODS[0]
+    _ordered_methods = [_preferred] + [m for m in _ALL_METHODS if m != _preferred]
+    bot_activity_logger.info(f"OCR method order: {_ordered_methods}")
+
+    # ── OCR log: record every image processed ─────────────────────────────────
+    ocr_logger.info("=" * 60)
+    ocr_logger.info(f"[OCR START] file={image_name}  size={len(image_bytes):,} bytes  order={_ordered_methods}")
+
     extracted_text = None
-    
-    # 1. Try external service first
-    if EXTERNAL_OCR_SERVICE_URL:
-        try:
-            bot_activity_logger.info(f"Trying external OCR service at {EXTERNAL_OCR_SERVICE_URL}")
-            extracted_text = await _sync_external_service_image_to_text(image_bytes)
-            bot_activity_logger.info("Successfully extracted text using external OCR service")
-        except Exception as e:
-            bot_activity_logger.warning(f"External OCR failed: {e}")
-    
-    # 2. Try Google Drive API
+
+    # ── Resolve Google Drive creds once (needed by the google_drive step) ───
     use_drive_api = True
     drive_error = None
     if not creds:
@@ -527,42 +517,76 @@ async def image_to_text(db, image_data, bot=None, owners=None, image_name="Temp_
             else:
                 use_drive_api = False
     
-    # 2. Try Google Drive API if no text yet
-    if not extracted_text and use_drive_api:
-        try:
-            image_data.seek(0)
-            service = await loop.run_in_executor(None, _sync_get_drive_service, creds)
-            extracted_text = await loop.run_in_executor(
-                None, partial(_sync_image_to_text, service, image_data, image_name)
-            )
-            bot_activity_logger.info("Successfully extracted text using Google Drive API")
-        except Exception as e:
-            drive_error = str(e)
-            bot_activity_logger.warning(f"Google Drive API failed: {e}")
-    
-    # 3. Try Tesseract if no text yet
-    if not extracted_text and TESSERACT_AVAILABLE:
-        try:
-            image_data_fallback = io.BytesIO(image_bytes)
-            extracted_text = await loop.run_in_executor(None, _sync_tesseract_image_to_text, image_data_fallback)
-            bot_activity_logger.info("Successfully extracted text using Tesseract OCR")
-        except Exception as e:
-            bot_activity_logger.error(f"Tesseract failed: {e}")
-    
-    # 4. Try EasyOCR as last resort
-    if not extracted_text and EASYOCR_AVAILABLE:
-        try:
-            image_data_fallback = io.BytesIO(image_bytes)
-            extracted_text = await loop.run_in_executor(None, _sync_easyocr_image_to_text, image_data_fallback)
-            bot_activity_logger.info("Successfully extracted text using EasyOCR")
-        except Exception as e:
-            bot_activity_logger.error(f"EasyOCR failed: {e}")
-    
+    # ── Run through each method in priority order ────────────────────────────
+    for _method in _ordered_methods:
+
+        if extracted_text:
+            break
+
+        if _method == "external":
+            if not EXTERNAL_OCR_SERVICE_URL:
+                bot_activity_logger.debug("Skipping external OCR: EXTERNAL_OCR_SERVICE_URL not set.")
+                ocr_logger.info(f"[SKIP] external — EXTERNAL_OCR_SERVICE_URL not set")
+                continue
+            try:
+                ocr_logger.info(f"[TRY] external — {EXTERNAL_OCR_SERVICE_URL}")
+                bot_activity_logger.info(f"Trying external OCR service at {EXTERNAL_OCR_SERVICE_URL}")
+                extracted_text = await _sync_external_service_image_to_text(image_bytes)
+                ocr_logger.info(f"[OK]  external — {len(extracted_text):,} chars extracted")
+                bot_activity_logger.info("Successfully extracted text using external OCR service")
+            except Exception as e:
+                ocr_logger.info(f"[FAIL] external — {e}")
+                bot_activity_logger.warning(f"External OCR failed: {e}")
+
+        elif _method == "google_drive":
+            if not use_drive_api:
+                bot_activity_logger.debug("Skipping Google Drive OCR: credentials not available.")
+                ocr_logger.info(f"[SKIP] google_drive — credentials not available")
+                continue
+            try:
+                ocr_logger.info(f"[TRY] google_drive")
+                image_data.seek(0)
+                service = await loop.run_in_executor(None, _sync_get_drive_service, creds)
+                extracted_text = await loop.run_in_executor(
+                    None, partial(_sync_image_to_text, service, image_data, image_name)
+                )
+                ocr_logger.info(f"[OK]  google_drive — {len(extracted_text):,} chars extracted")
+                bot_activity_logger.info("Successfully extracted text using Google Drive API")
+            except Exception as e:
+                drive_error = str(e)
+                ocr_logger.info(f"[FAIL] google_drive — {e}")
+                bot_activity_logger.warning(f"Google Drive API failed: {e}")
+
+        elif _method == "tesseract":
+            if not TESSERACT_AVAILABLE:
+                bot_activity_logger.debug(
+                    "Skipping Tesseract OCR: not available "
+                    "(INSTALL_TESSERACT=false or pytesseract/tesseract-ocr not installed)."
+                )
+                ocr_logger.info(f"[SKIP] tesseract — not available (INSTALL_TESSERACT=false or missing package)")
+                continue
+            try:
+                ocr_logger.info(f"[TRY] tesseract")
+                image_data_fallback = io.BytesIO(image_bytes)
+                extracted_text = await loop.run_in_executor(
+                    None, _sync_tesseract_image_to_text, image_data_fallback
+                )
+                ocr_logger.info(f"[OK]  tesseract — {len(extracted_text):,} chars extracted")
+                bot_activity_logger.info("Successfully extracted text using Tesseract OCR")
+            except Exception as e:
+                ocr_logger.info(f"[FAIL] tesseract — {e}")
+                bot_activity_logger.error(f"Tesseract failed: {e}")
+
     if not extracted_text:
-        raise Exception("All OCR methods failed!")
-    
+        ocr_logger.info(f"[RESULT] ALL METHODS FAILED — returning empty string")
+        bot_activity_logger.warning(
+            "All OCR methods failed or were skipped — returning empty text silently."
+        )
+        return ""
+
     # Clean the text for stock market alerts
     cleaned_text = clean_ocr_text(extracted_text)
+    ocr_logger.info(f"[RESULT] clean_len={len(cleaned_text):,}  preview={cleaned_text[:120]!r}")
     return cleaned_text
 
 

@@ -164,8 +164,10 @@ def setup_ocr_logger():
     file_handler = ManagedFileHandler(log_filename, encoding="utf-8")
     file_handler.setLevel(logging.INFO)
 
-    # No timestamps for OCR logs - just clean messages
-    log_format = logging.Formatter("%(message)s")
+    log_format = ISTFormatter(
+        "%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S IST"
+    )
     file_handler.setFormatter(log_format)
     logger.addHandler(file_handler)
     logger.propagate = False
