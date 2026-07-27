@@ -24,7 +24,7 @@ EXTERNAL_OCR_SERVICE_URL = os.getenv("EXTERNAL_OCR_SERVICE_URL","http://localhos
 # Default OCR method to attempt first.
 # Options: "external", "google_drive", "tesseract"
 # The remaining methods are still tried as fallbacks in order.
-DEFAULT_OCR_METHOD = os.getenv("DEFAULT_OCR_METHOD", "external")
+DEFAULT_OCR_METHOD = os.getenv("DEFAULT_OCR_METHOD", "tesseract")
 
 # Whether to enable Tesseract (pytesseract) as a local OCR option.
 # Set to "true" to enable. Requires pytesseract + system package tesseract-ocr to be installed.
