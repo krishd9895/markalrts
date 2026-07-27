@@ -438,6 +438,21 @@ async def save_last_scan_time(ts: datetime):
     )
 
 
+async def get_last_successful_scan_time():
+    """Return the completion timestamp of the last fully successful scan, or None."""
+    doc = await db["config"].find_one({"_id": "last_scan_info"})
+    return doc.get("last_successful_scan_at") if doc else None
+
+
+async def save_last_successful_scan_time(ts: datetime):
+    """Persist the completion time of a successful scan so files can report it."""
+    await db["config"].update_one(
+        {"_id": "last_scan_info"},
+        {"$set": {"last_successful_scan_at": ts}},
+        upsert=True
+    )
+
+
 def extract_real_filename(original_message, fallback_entity_name: str) -> str:
     """
     Robustly extracts the true filename from a Telegram document message.
@@ -2113,7 +2128,7 @@ async def scan_old_messages_command(event: events.NewMessage.Event):
     bot_activity_logger.info("MANUAL SCAN TRIGGERED VIA /scan_old_messages (/som) COMMAND")
     bot_activity_logger.info("="*80)
     try:
-        await scan_channels_for_last_24h_portfolio_messages()
+        await scan_channels_for_last_24h_portfolio_messages(force_full_scan=True)
         await event.respond("✅ Scan complete! Check your messages for forwarded last 24 hour data and summary files.")
     except Exception as ex:
         logger.error(f"Error during manual scan: {ex}")
@@ -2755,11 +2770,16 @@ async def incoming_stream_pipeline(event: events.NewMessage.Event):
 # =====================================================================
 # STARTUP CHECK: SCAN CHANNELS FOR OLD PORTFOLIO MESSAGES IF NO RECENT NEWS
 # =====================================================================
-async def scan_channels_for_last_24h_portfolio_messages():
+async def scan_channels_for_last_24h_portfolio_messages(force_full_scan: bool = False):
     """
     Scans all monitored channels for messages about portfolio stocks (last 24 hours)
     and forwards them to owners, indicating they are last 24 hour data.
-    Called on startup if no recent news hashes are found OR via /scan_old_messages command.
+    Called via /scan_old_messages command (force_full_scan=True for complete coverage).
+
+    When force_full_scan=True (manual /scan_old_messages):
+      - Always fetches the full 24h window from Telegram — no incremental shortcut.
+      - Skips the processed_messages and cached_message_keys checks so portfolio
+        rule changes are applied to ALL messages in the window, not just new ones.
     """
     if not user:
         logger.error("Cannot scan channels: user session not configured.")
@@ -2767,15 +2787,22 @@ async def scan_channels_for_last_24h_portfolio_messages():
     logger.info("Checking for last 24 hour portfolio and macro messages in monitored channels...")
     channel_logger.info("="*80)
     channel_logger.info("STARTING CHANNEL SCAN FOR LAST 24 HOUR PORTFOLIO & MACRO MESSAGES")
+    channel_logger.info(f"Scan type: {'FULL 24H RESCAN (force_full_scan=True)' if force_full_scan else 'INCREMENTAL'}")
     channel_logger.info("="*80)
     bot_activity_logger.info(f"Scan started at: " + datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"))
-    
+    bot_activity_logger.info(f"force_full_scan={force_full_scan}")
+
     # Calculate cutoff time (24h ago in IST)
     now_ist = datetime.now(IST)
     cutoff_ist = now_ist - timedelta(days=1)
     bot_activity_logger.info(f"Cutoff time for messages: {cutoff_ist.strftime('%Y-%m-%d %H:%M:%S IST')}")
 
-    # ── Scan cache: load previous matched results, compute incremental fetch window ──
+    # Fetch last successful scan time for file headers
+    last_successful_scan_at = await get_last_successful_scan_time()
+    if last_successful_scan_at and last_successful_scan_at.tzinfo is None:
+        last_successful_scan_at = last_successful_scan_at.replace(tzinfo=IST)
+
+    # ── Scan cache: load previous matched results ──────────────────────────────────
     last_scan_at = await get_last_scan_time()
     if last_scan_at and last_scan_at.tzinfo is None:
         last_scan_at = last_scan_at.replace(tzinfo=IST)
@@ -2787,12 +2814,26 @@ async def scan_channels_for_last_24h_portfolio_messages():
 
     bot_activity_logger.info(
         f"Scan cache: {len(cached_messages)} cached match(es) within the last 24h. "
-        f"Last scan started at: {last_scan_at.strftime('%Y-%m-%d %H:%M:%S IST') if last_scan_at else 'never'}"
+        f"Last scan started at: {last_scan_at.strftime('%Y-%m-%d %H:%M:%S IST') if last_scan_at else 'never'}. "
+        f"Last successful scan completed: {last_successful_scan_at.strftime('%Y-%m-%d %H:%M:%S IST') if last_successful_scan_at else 'never'}"
     )
 
-    # Only fetch messages from Telegram that are NEWER than the last scan start time.
-    # This avoids re-iterating messages already processed; on first run fetch the full 24h window.
-    if last_scan_at and last_scan_at > cutoff_ist:
+    # ── Determine Telegram fetch window ───────────────────────────────────────────
+    # force_full_scan (manual /scan_old_messages): ALWAYS fetch the full 24h window.
+    # This guarantees no messages are missed even if portfolio rules changed since
+    # the last scan. The processed_messages and cached_message_keys checks are also
+    # bypassed in the inner loop (see below) for the same reason.
+    #
+    # Normal (incremental): only fetch messages newer than the last scan start time;
+    # rely on the matched-message cache for the earlier portion of the window.
+    if force_full_scan:
+        telegram_fetch_from = cutoff_ist
+        bot_activity_logger.info(
+            f"Full 24h Telegram fetch (force_full_scan=True): fetching all messages since "
+            f"{telegram_fetch_from.strftime('%Y-%m-%d %H:%M:%S IST')}. "
+            f"processed_messages and cache checks are BYPASSED to ensure nothing is missed."
+        )
+    elif last_scan_at and last_scan_at > cutoff_ist:
         telegram_fetch_from = last_scan_at
         bot_activity_logger.info(
             f"Incremental Telegram fetch: requesting only messages after "
@@ -2850,8 +2891,18 @@ async def scan_channels_for_last_24h_portfolio_messages():
     
     # Collect all matched messages first (for text files, no hash checks yet)
     all_matched_messages = []
-    max_messages_per_channel = 1000  # Prevent endless scanning
-    bot_activity_logger.info(f"Starting to collect matched messages (max {max_messages_per_channel} per channel)...")
+    # force_full_scan raises the per-channel fetch cap so busy channels (e.g. macro
+    # news feeds) don't get truncated. 3000 covers ~125 msgs/h which is beyond any
+    # realistic Telegram channel. The date-boundary break (5 consecutive old messages)
+    # still fires first on quiet channels, so this does not slow normal scans down.
+    max_messages_per_channel = 3000 if force_full_scan else 1000
+    bot_activity_logger.info(
+        f"Starting to collect matched messages "
+        f"(max {max_messages_per_channel} per channel, force_full_scan={force_full_scan})..."
+        f"\nNOTE: text messages and PDFs are handled by the text filter (Pass 1) and are "
+        f"NEVER dependent on OCR. OCR (Pass 2) only applies to photo-only messages; "
+        f"OCR failures will not cause text or PDF matches to be missed."
+    )
     
     for i, channel_id in enumerate(monitored_ids, 1):
         try:
@@ -2885,13 +2936,19 @@ async def scan_channels_for_last_24h_portfolio_messages():
             ):
                 messages_scanned += 1
                 
-                # Check if message has already been processed
-                if await is_message_processed(channel_id, message.id):
-                    messages_skipped +=1
+                # Check if message has already been processed.
+                # BYPASSED for force_full_scan: we re-evaluate every message in the
+                # 24h window so that portfolio rule changes are applied retroactively
+                # and nothing is silently skipped.
+                if not force_full_scan and await is_message_processed(channel_id, message.id):
+                    messages_skipped += 1
                     continue
-                
-                # Mark message as processed immediately
-                await mark_message_processed(channel_id, message.id)
+
+                # Mark message as processed to prevent double-processing within this
+                # scan run. Skipped for force_full_scan to avoid polluting the dedup
+                # DB for the live pipeline (which uses its own recent_news_hashes TTL).
+                if not force_full_scan:
+                    await mark_message_processed(channel_id, message.id)
                 
                 # Update progress with message count every 50 messages to avoid Telegram rate limits
                 if messages_scanned % 50 == 0:
@@ -2926,8 +2983,11 @@ async def scan_channels_for_last_24h_portfolio_messages():
                         break
                     continue
 
-                # Skip if this message is already stored in the scan cache (matched in a previous run)
-                if (channel_id, message.id) in cached_message_keys:
+                # Skip if this message is already stored in the scan cache (matched in a
+                # previous run). BYPASSED for force_full_scan so every message in the 24h
+                # window is re-evaluated — this handles the case where the portfolio
+                # changed and a previously-unmatched message would now match.
+                if not force_full_scan and (channel_id, message.id) in cached_message_keys:
                     messages_skipped += 1
                     continue
 
@@ -3120,8 +3180,18 @@ async def scan_channels_for_last_24h_portfolio_messages():
                 _interim_macro.append(_m)
 
     _now_interim_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
-    _interim_portfolio_content = f"Text-Matched Portfolio News (Pre-OCR)\nGenerated on: {_now_interim_str}\n\n"
-    _interim_macro_content = f"Text-Matched Macro News (Pre-OCR)\nGenerated on: {_now_interim_str}\n\n"
+    _scan_window_str = f"{cutoff_ist.strftime('%Y-%m-%d %H:%M:%S IST')} → {_now_interim_str}"
+    _last_success_str = last_successful_scan_at.strftime('%Y-%m-%d %H:%M:%S IST') if last_successful_scan_at else "Never"
+    _scan_type_str = "Full 24h Rescan (/scan_old_messages)" if force_full_scan else "Incremental"
+    _interim_header = (
+        f"Generated on:         {_now_interim_str}\n"
+        f"Scan window:          {_scan_window_str}\n"
+        f"Scan type:            {_scan_type_str}\n"
+        f"Last successful scan: {_last_success_str}\n"
+        f"Note: OCR scan still in progress — final files with image results will follow.\n\n"
+    )
+    _interim_portfolio_content = f"Last 24 Hour Portfolio News (Pre-OCR / Text Matches)\n{_interim_header}"
+    _interim_macro_content = f"Last 24 Hour Macro News (Pre-OCR / Text Matches)\n{_interim_header}"
 
     for _idx, _msg in enumerate(_interim_portfolio, 1):
         _interim_portfolio_content += f"--- Message {_idx} ---\n"
@@ -3494,14 +3564,18 @@ async def scan_channels_for_last_24h_portfolio_messages():
             continue
         msg_hash = msg.get('msg_hash')
         if msg_hash:
-            # Check if we've already seen this hash in this scan
+            # Deduplicate within this scan run (always enforced)
             if msg_hash in seen_hashes_in_scan:
                 bot_activity_logger.info(f"[SKIPPED (SCAN)] Duplicate in scan: {msg['deep_link']}")
                 continue
-            # Check if we've already processed this message before (12h hash window)
-            if await db["recent_news_hashes"].find_one({"_id": msg_hash}):
-                channel_logger.info(f"[FILTERED (SCAN)] Already processed message - Skipping forwarding")
-                bot_activity_logger.info(f"[SKIPPED] Already processed: {msg['deep_link']}")
+            # recent_news_hashes dedup — BYPASSED for force_full_scan.
+            # The live pipeline writes to this collection while the bot is running, so
+            # without this bypass any message the bot caught before shutdown would be
+            # silently skipped here, even though it was never delivered via /som.
+            # On a force_full_scan we want to re-deliver everything in the 24h window.
+            if not force_full_scan and await db["recent_news_hashes"].find_one({"_id": msg_hash}):
+                channel_logger.info(f"[FILTERED (SCAN)] Already processed by live pipeline - Skipping forwarding")
+                bot_activity_logger.info(f"[SKIPPED] Already processed by live pipeline: {msg['deep_link']}")
                 continue
             seen_hashes_in_scan.add(msg_hash)
         messages_to_forward.append(msg)
@@ -3548,8 +3622,17 @@ async def scan_channels_for_last_24h_portfolio_messages():
     
     # Generate final text file contents using all unique matched messages (including OCR)
     now_ist_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
-    final_portfolio_content = f"Last 24 Hour Portfolio News\nGenerated on: {now_ist_str}\n\n"
-    final_macro_content = f"Last 24 Hour Macro News\nGenerated on: {now_ist_str}\n\n"
+    _final_scan_window = f"{cutoff_ist.strftime('%Y-%m-%d %H:%M:%S IST')} → {now_ist_str}"
+    _final_last_success = last_successful_scan_at.strftime('%Y-%m-%d %H:%M:%S IST') if last_successful_scan_at else "Never (this is the first successful scan)"
+    _final_scan_type = "Full 24h Rescan (/scan_old_messages)" if force_full_scan else "Incremental"
+    _final_header = (
+        f"Generated on:         {now_ist_str}\n"
+        f"Scan window:          {_final_scan_window}\n"
+        f"Scan type:            {_final_scan_type}\n"
+        f"Last successful scan: {_final_last_success}\n\n"
+    )
+    final_portfolio_content = f"Last 24 Hour Portfolio News\n{_final_header}"
+    final_macro_content = f"Last 24 Hour Macro News\n{_final_header}"
     
     # Fill portfolio messages (all unique, including OCR)
     for idx, msg in enumerate(final_portfolio_messages, 1):
@@ -3640,7 +3723,10 @@ async def scan_channels_for_last_24h_portfolio_messages():
                             logger.error(f"Failed to send photo: {photo_err}")
                             bot_activity_logger.error(f"  ✗ Failed to send photo: {photo_err}")
 
-                    # Handle PDF if present
+                    # Handle PDF if present — PDFs are critical for decision making;
+                    # always attempt to send the actual file, and if that fails send
+                    # an explicit warning with the source link so the user can retrieve
+                    # it manually. Never silently drop a PDF match.
                     if msg.get("has_pdf") and user:
                         try:
                             bot_activity_logger.info(f"  Processing PDF from message {msg['message_id']}...")
@@ -3663,11 +3749,43 @@ async def scan_channels_for_last_24h_portfolio_messages():
                                 )
                                 bot_activity_logger.info(f"  ✓ PDF sent to {owner} with filename: {pdf_filename}")
                                 continue
+                            else:
+                                # download_media returned None — send explicit warning
+                                fallback = (
+                                    header
+                                    + f"⚠️ **PDF download returned empty — retrieve manually.**\n"
+                                    f"Source: {msg['deep_link']}"
+                                )
+                                if msg.get("pdf_filename"):
+                                    fallback += f"\nFilename: {msg['pdf_filename']}"
+                                if msg.get("text"):
+                                    fallback += f"\n\n{msg['text']}"
+                                await bot.send_message(owner_entity, fallback, link_preview=False)
+                                bot_activity_logger.warning(f"  ⚠ PDF download returned empty for {msg['deep_link']} — fallback text sent.")
+                                continue
                         except Exception as pdf_err:
                             logger.error(f"Failed to send PDF: {pdf_err}")
                             bot_activity_logger.error(f"  ✗ Failed to send PDF: {pdf_err}")
+                            # Explicit failure notice — do NOT silently fall through to
+                            # the plain-text path or the user won't know there was a PDF.
+                            try:
+                                fallback = (
+                                    header
+                                    + f"⚠️ **PDF could not be sent — retrieve manually.**\n"
+                                    f"Error: {pdf_err}\n"
+                                    f"Source: {msg['deep_link']}"
+                                )
+                                if msg.get("pdf_filename"):
+                                    fallback += f"\nFilename: {msg['pdf_filename']}"
+                                if msg.get("text"):
+                                    fallback += f"\n\n{msg['text']}"
+                                await bot.send_message(owner_entity, fallback, link_preview=False)
+                                bot_activity_logger.info(f"  ✓ PDF failure notice sent to {owner}")
+                            except Exception as fallback_err:
+                                bot_activity_logger.error(f"  ✗ Failed to send PDF failure notice: {fallback_err}")
+                            continue  # PDF path handled (with error notice); don't re-send as plain text
 
-                    # Handle text only
+                    # Handle text-only message (no photo, no PDF)
                     full_message = header + f"Source: {msg['deep_link']}"
                     if msg.get("text"):
                         full_message += f"\n\n{msg['text']}"
@@ -3724,14 +3842,32 @@ async def scan_channels_for_last_24h_portfolio_messages():
         log_matched_message(msg, sent_to_user=True)
         await save_sent_to_user_db(msg)
     
-    bot_activity_logger.info("Scan and forwarding complete!")
+    # Record the completion time of this successful scan so the next run can report it
+    scan_completed_at = datetime.now(IST)
+    await save_last_successful_scan_time(scan_completed_at)
+    bot_activity_logger.info(
+        f"Scan and forwarding complete! "
+        f"Last successful scan recorded at: {scan_completed_at.strftime('%Y-%m-%d %H:%M:%S IST')}"
+    )
 
 
 async def send_empty_scan_text_files():
     """Helper function to send empty text files when no channels are configured or no messages are matched."""
-    now_ist_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
-    portfolio_file_content = f"Last 24 Hour Portfolio News\nGenerated on: {now_ist_str}\n\nNo messages found.\n"
-    macro_file_content = f"Last 24 Hour Macro News\nGenerated on: {now_ist_str}\n\nNo messages found.\n"
+    now_ist = datetime.now(IST)
+    now_ist_str = now_ist.strftime("%Y-%m-%d %H:%M:%S IST")
+    cutoff_ist = now_ist - timedelta(days=1)
+    last_successful_scan_at = await get_last_successful_scan_time()
+    if last_successful_scan_at and last_successful_scan_at.tzinfo is None:
+        last_successful_scan_at = last_successful_scan_at.replace(tzinfo=IST)
+    _last_success_str = last_successful_scan_at.strftime('%Y-%m-%d %H:%M:%S IST') if last_successful_scan_at else "Never"
+    _header = (
+        f"Generated on:         {now_ist_str}\n"
+        f"Scan window:          {cutoff_ist.strftime('%Y-%m-%d %H:%M:%S IST')} → {now_ist_str}\n"
+        f"Last successful scan: {_last_success_str}\n\n"
+        f"No messages found.\n"
+    )
+    portfolio_file_content = f"Last 24 Hour Portfolio News\n{_header}"
+    macro_file_content = f"Last 24 Hour Macro News\n{_header}"
     
     for owner in OWNERS:
         try:

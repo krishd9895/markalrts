@@ -9,8 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir flask pillow pytesseract
 
-COPY simple-ocr-service.py .
+COPY external_ocr_api.py .
 
 EXPOSE 8181
 
-CMD ["python", "simple-ocr-service.py"]
+CMD ["python", "external_ocr_api.py"]
