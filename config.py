@@ -22,8 +22,8 @@ MAX_LOG_SIZE_BYTES = int(os.getenv("MAX_LOG_SIZE_BYTES", 2 * 1024 * 1024))  # 2M
 EXTERNAL_OCR_SERVICE_URL = os.getenv("EXTERNAL_OCR_SERVICE_URL","http://localhost:8181/api/ocr")
 
 # Default OCR method to attempt first.
-# Options: "external", "google_drive", "tesseract"
-# The remaining methods are still tried as fallbacks in order.
+# Options: "external", "tesseract"
+# The remaining method is tried as a fallback.
 DEFAULT_OCR_METHOD = os.getenv("DEFAULT_OCR_METHOD", "tesseract")
 
 # Whether to enable Tesseract (pytesseract) as a local OCR option.

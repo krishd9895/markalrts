@@ -19,8 +19,7 @@ def _ensure_dependencies():
     """
     _required = [
         "telethon", "motor", "apscheduler",
-        "dotenv", "flask", "googleapiclient", "google.auth",
-        "google_auth_oauthlib",
+        "dotenv", "flask",
     ]
     missing = []
     for pkg in _required:
@@ -63,7 +62,22 @@ class ISTFormatter(logging.Formatter):
 # Telethon
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import Channel, Chat, User, DocumentAttributeFilename, PeerUser
-from telethon.errors import MessageTooLongError
+from telethon.errors import (
+    MessageTooLongError,
+    PersistentTimestampOutdatedError,
+    HistoryGetFailedError,
+    SessionPasswordNeededError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    FloodWaitError,
+    AuthKeyError,
+    AuthKeyDuplicatedError,
+    AuthKeyUnregisteredError,
+    SessionExpiredError,
+    UserDeactivatedBanError,
+    PhoneNumberBannedError,
+)
+from telethon.errors.rpcerrorlist import UnauthorizedError
 
 # Scheduler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -71,8 +85,17 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # Local modules
 from config import API_ID, API_HASH, BOT_TOKEN, OWNERS, MONITORED_CHANNELS, db
 from logs import channel_logger, bot_activity_logger, ocr_logger
-from ocr import image_to_text, test_google_credentials
+from ocr import image_to_text
 from progress import ProgressManager
+from session import (
+    USER_CLIENT_STATUS,
+    classify_user_client_error,
+    notify_owners_about_user_client_error as _session_notify_owners,
+    build_safe_pipeline_wrapper,
+    apply_user_session_and_reconnect as _session_apply_user_session,
+    start_user_client_safely,
+    user_client_run_wrapper as _session_user_client_run_wrapper,
+)
 
 # Setup logging
 class TelethonWarningFilter(logging.Filter):
@@ -139,8 +162,24 @@ bot = TelegramClient(
     api_hash=API_HASH
 )
 
+async def notify_owners_about_user_client_error(error_msg: str, error_type: str = "general"):
+    """Thin wrapper around session.py's notifier — pre-injects main.py's globals
+    (bot, owners, IST, clean_text_for_telegram) so call sites stay 2-arg simple."""
+    await _session_notify_owners(
+        error_msg,
+        error_type,
+        bot_client=bot,
+        owners=list(OWNERS),
+        ist_tz=IST,
+        clean_text_fn=clean_text_for_telegram,
+    )
+
 # User client will be initialized in main() after loading session from DB
 user = None  # type: TelegramClient
+
+async def _safe_incoming_stream_pipeline(event):
+    """Placeholder — replaced after incoming_stream_pipeline is defined."""
+    pass
 
 # =====================================================================
 # HELPER DATA LAYER OPERATIONS
@@ -664,9 +703,6 @@ def build_settings_keyboard() -> list:
         ],
         [
             Button.inline("🔐 Manage User Session", data="manage_user_session")
-        ],
-        [
-            Button.inline("📄 Google Drive Credentials", data="manage_google_creds")
         ]
     ]
     return keyboard
@@ -674,12 +710,41 @@ def build_settings_keyboard() -> list:
 async def _settings_keyboard(config: dict) -> list:
     """Builds the settings keyboard."""
     return build_settings_keyboard()
+
+@bot.on(events.NewMessage(pattern="/start"))
 async def start_command_handler(event: events.NewMessage.Event):
-    await event.respond(
-        "👋 **Welcome to Market Intelligence Bot!**\n\n"
-        "This bot monitors Telegram channels for financial news and forwards them against your portfolio.\n\n"
-        "Use /settings to configure the bot _(owners only)_."
-    )
+    user_id = event.sender_id
+    if user_id and is_authorized(user_id):
+        config = await get_system_config()
+        has_session = bool(config and config.get("user_session", ""))
+        uc_connected = USER_CLIENT_STATUS.get("connected", False)
+        last_err = USER_CLIENT_STATUS.get("last_error", "")
+        if not has_session:
+            extra = (
+                "\n\n⚠️ **No user session is saved yet.**\n"
+                "Run `/generate_session` now and complete the phone + OTP flow so the bot can read monitored channels.\n"
+            )
+        elif not uc_connected and last_err:
+            etype = classify_user_client_error(Exception(last_err)) if last_err else "general"
+            extra = (
+                f"\n\n⚠️ **User session has a problem:**\n"
+                f"`{clean_text_for_telegram(last_err, 200)}`\n\n"
+                "Run `/generate_session` to re-authenticate with a fresh session.\n"
+            )
+        else:
+            extra = ""
+        await event.respond(
+            "👋 **Welcome to Market Intelligence Bot!**\n\n"
+            "This bot monitors Telegram channels for financial news and forwards matches against your portfolio.\n\n"
+            "Use /settings to configure the bot _(owners only)_."
+            + extra
+        )
+    else:
+        await event.respond(
+            "👋 **Welcome to Market Intelligence Bot!**\n\n"
+            "This bot monitors Telegram channels for financial news and forwards matches against your portfolio.\n\n"
+            "This is a restricted bot. Contact the administrator for access."
+        )
 
 @bot.on(events.NewMessage(pattern="/help"))
 async def help_command(event):
@@ -697,6 +762,7 @@ async def help_command(event):
         "/add_ocr_channel [link/id] - Add a new channel to OCR list\n"
         "/remove_ocr_channel [link/id] - Stop OCR on a channel\n"
         "/scan_old_messages (or /som) - Scan last 24h of monitored channels for missed messages\n"
+        "/generate_session - Generate a new Telegram user session via phone + OTP\n"
         "/logs - Send today's activity and channel logs\n"
         "/help - Show this command list\n\n"
         "**Settings Menu Features:**\n"
@@ -1082,207 +1148,74 @@ async def callback_dispatcher(event: events.CallbackQuery.Event):
     
     elif data == "clear_user_session":
         await db["config"].update_one({"_id": "bot_settings"}, {"$set": {"user_session": ""}})
-        await event.answer("User session cleared. Please restart the bot for changes to take effect.", alert=True)
-        await event.edit("Cleared.", buttons=await _settings_keyboard(config))
+        ok, msg = await apply_user_session_and_reconnect("")
+        await event.answer(
+            "Session cleared." if ok else "Session cleared (reconnect reported an issue).",
+            alert=True,
+        )
+        await event.edit(msg, buttons=await _settings_keyboard(config))
     
-    elif data == "manage_google_creds":
-        # Get current Google Drive credentials from DB
-        google_creds = await db["config"].find_one({"_id": "google_drive_creds"})
-        txt = "📄 **Google Drive Credentials**\n\n"
-        if google_creds:
-            if google_creds.get("service_account"):
-                txt += "✅ Service account credentials found in database (recommended, no token refresh needed!)\n"
-            elif google_creds.get("token"):
-                txt += "✅ OAuth credentials and token found in database.\n"
-            elif google_creds.get("credentials"):
-                txt += "✅ OAuth credentials found in database, but no token.\n"
-            else:
-                txt += "❌ No valid credentials found in database.\n"
-        else:
-            txt += "❌ No credentials found in database.\n"
-        txt += "\n💡 **Tip**: Using a Service Account is **strongly recommended** - it doesn't require token refreshes and doesn't need any redirect URI setup! Just upload the service account JSON key file.\n"
-        kbd = []
-        if google_creds and google_creds.get("service_account"):
-            kbd.append([Button.inline("📥 Download service account key", data="download_service_account")])
-        if google_creds and google_creds.get("credentials"):
-            kbd.append([Button.inline("📥 Download OAuth credentials.json", data="download_google_creds")])
-        if google_creds and google_creds.get("token"):
-            kbd.append([Button.inline("📥 Download OAuth token.json", data="download_google_token")])
-        kbd.extend([
-            [Button.inline("✅ Test Google Drive Credentials", data="test_google_creds")],
-            [Button.inline("📤 Upload Service Account Key (Recommended)", data="upload_service_account")],
-            [Button.inline("📤 Upload OAuth credentials.json", data="upload_google_creds")],
-            [Button.inline("📤 Upload OAuth token.json", data="upload_google_token")],
-        ])
-        # Add option to start OAuth flow if credentials are present
-        if google_creds and google_creds.get("credentials"):
-            kbd.append([Button.inline("🔗 Start OAuth Authentication Flow (Phone)", data="start_oauth_flow")])
-        kbd.append([Button.inline("⬅️ Back", data="back_to_settings")])
-        await event.edit(txt, buttons=kbd)
-    
-    elif data == "download_google_creds":
-        # Get current Google Drive credentials from DB
-        google_creds = await db["config"].find_one({"_id": "google_drive_creds"})
-        if not google_creds or not google_creds.get("credentials"):
-            await event.answer("No credentials found to download.", alert=True)
-            return
-        
-        import io
-        import json
-        creds_bytes = json.dumps(google_creds["credentials"], indent=2).encode("utf-8")
-        creds_bytesio = io.BytesIO(creds_bytes)
-        creds_bytesio.name = "credentials.json"
-        
-        await bot.send_file(event.sender_id, creds_bytesio, caption="📄 Your Google Drive credentials.json")
-        await event.answer("Download sent!", alert=True)
-    
-    elif data == "download_service_account":
-        # Get current Google Drive service account from DB
-        google_creds = await db["config"].find_one({"_id": "google_drive_creds"})
-        if not google_creds or not google_creds.get("service_account"):
-            await event.answer("No service account key found to download.", alert=True)
-            return
-        
-        import io
-        import json
-        sa_bytes = json.dumps(google_creds["service_account"], indent=2).encode("utf-8")
-        sa_bytesio = io.BytesIO(sa_bytes)
-        sa_bytesio.name = "service_account.json"
-        
-        await bot.send_file(event.sender_id, sa_bytesio, caption="📄 Your Google Drive service account key")
-        await event.answer("Download sent!", alert=True)
-    
-    elif data == "download_google_token":
-        # Get current Google Drive token from DB
-        google_creds = await db["config"].find_one({"_id": "google_drive_creds"})
-        if not google_creds or not google_creds.get("token"):
-            await event.answer("No token found to download.", alert=True)
-            return
-        
-        import io
-        import json
-        token_bytes = json.dumps(google_creds["token"], indent=2).encode("utf-8")
-        token_bytesio = io.BytesIO(token_bytes)
-        token_bytesio.name = "token.json"
-        
-        await bot.send_file(event.sender_id, token_bytesio, caption="📄 Your Google Drive token.json")
-        await event.answer("Download sent!", alert=True)
-    
-    elif data == "upload_google_creds":
-        USER_STATES[user_id] = {"action": "AWAITING_GOOGLE_CREDS"}
-        await event.edit("📤 Please upload your credentials.json file (from Google Cloud Console):", buttons=[[Button.inline("❌ Cancel", data="back_to_settings")]])
-    
-    elif data == "start_oauth_flow":
-        # Get Google OAuth credentials from DB
-        google_creds = await db["config"].find_one({"_id": "google_drive_creds"})
-        if not google_creds or not google_creds.get("credentials"):
-            await event.answer("Please upload OAuth credentials.json first!", alert=True)
-            return
-        
-        # Import necessary modules
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        SCOPES = ["https://www.googleapis.com/auth/drive"]
-        
-        try:
-            # Create flow with the special out-of-band redirect URI
-            flow = InstalledAppFlow.from_client_config(google_creds["credentials"], SCOPES)
-            flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"  # This is the special redirect URI for manual code flow
-            
-            # Generate authorization URL and get PKCE code verifier
-            auth_url, state = flow.authorization_url(
-                prompt="consent", 
-                access_type="offline", 
-                include_granted_scopes="true",
-                code_challenge_method="S256"  # Enable PKCE
-            )
-            
-            # Store the code verifier and flow state in USER_STATES
-            USER_STATES[user_id] = {
-                "action": "AWAITING_OAUTH_CODE",
-                "code_verifier": flow.code_verifier,
-                "state": state
-            }
-            
-            # Send the auth URL to the user
-            await event.edit(
-                f"🔗 **OAuth Authentication Flow Started!**\n\n"
-                f"💡 **Pro Tip**: Using a Service Account is much easier and doesn't require this flow! You can upload a Service Account JSON key instead.\n\n"
-                f"Please click the link below to authenticate with your Google account on your phone browser:\n"
-                f"{auth_url}\n\n"
-                f"After authenticating, copy the authorization code and send it here.",
-                buttons=[[Button.inline("❌ Cancel", data="back_to_settings")]]
-            )
-        except Exception as e:
-            await event.answer(f"Failed to start OAuth flow: {e}", alert=True)
-    
-    elif data == "upload_service_account":
-        USER_STATES[user_id] = {"action": "AWAITING_SERVICE_ACCOUNT"}
-        await event.edit("📤 Please upload your service account JSON key file (from Google Cloud Console - recommended, no token refresh needed!):", buttons=[[Button.inline("❌ Cancel", data="back_to_settings")]])
-    
-    elif data == "test_google_creds":
-        # Test the Google Drive credentials
-        await event.answer("Testing Google Drive credentials...")
-        success, message, details = await test_google_credentials(db)
-        
-        # Build detailed status message
-        status_text = f"📄 **Google Drive Credentials**\n\n"
-        status_text += f"**Stored Credentials:**\n"
-        status_text += f"- Service Account: {'✅ Yes' if details['service_account'] else '❌ No'}\n"
-        status_text += f"- OAuth Credentials: {'✅ Yes' if details['oauth_credentials'] else '❌ No'}\n"
-        status_text += f"- OAuth Token: {'✅ Yes' if details['oauth_token'] else '❌ No'}\n\n"
-        status_text += f"**Test Result:**\n{message}\n\n"
-        
-        # Add how to get credentials if test failed
-        if not success:
-            status_text += f"\n**How to get credentials:**\n\n"
-            status_text += f"**Service Account (Recommended):**\n"
-            status_text += f"1. Go to https://console.cloud.google.com/\n"
-            status_text += f"2. Create a new project or select existing one\n"
-            status_text += f"3. Enable 'Google Drive API' for the project\n"
-            status_text += f"4. Go to 'IAM & Admin' → 'Service Accounts'\n"
-            status_text += f"5. Create a new service account\n"
-            status_text += f"6. Click 'Add Key' → 'Create New Key' → select JSON\n"
-            status_text += f"7. Share your Google Drive folder/files with the service account email (found in the JSON file)\n\n"
-            status_text += f"**OAuth 2.0:**\n"
-            status_text += f"1. Go to https://console.cloud.google.com/\n"
-            status_text += f"2. Create a new project or select existing one\n"
-            status_text += f"3. Enable 'Google Drive API' for the project\n"
-            status_text += f"4. Go to 'APIs & Services' → 'Credentials'\n"
-            status_text += f"5. Create credentials → 'OAuth client ID'\n"
-            status_text += f"6. Application type: 'Desktop app'\n"
-            status_text += f"7. Download the JSON credentials file\n"
-        
-        # Rebuild keyboard
-        kbd = []
-        google_creds = await db["config"].find_one({"_id": "google_drive_creds"})
-        if google_creds and google_creds.get("service_account"):
-            kbd.append([Button.inline("📥 Download service account key", data="download_service_account")])
-        if google_creds and google_creds.get("credentials"):
-            kbd.append([Button.inline("📥 Download OAuth credentials.json", data="download_google_creds")])
-        if google_creds and google_creds.get("token"):
-            kbd.append([Button.inline("📥 Download OAuth token.json", data="download_google_token")])
-        kbd.extend([
-            [Button.inline("✅ Test Google Drive Credentials", data="test_google_creds")],
-            [Button.inline("📤 Upload Service Account Key (Recommended)", data="upload_service_account")],
-            [Button.inline("📤 Upload OAuth credentials.json", data="upload_google_creds")],
-            [Button.inline("📤 Upload OAuth token.json", data="upload_google_token")],
-        ])
-        if google_creds and google_creds.get("credentials"):
-            kbd.append([Button.inline("🔗 Start OAuth Authentication Flow (Phone)", data="start_oauth_flow")])
-        kbd.append([Button.inline("⬅️ Back", data="back_to_settings")])
-        
-        try:
-            await event.edit(status_text, buttons=kbd)
-        except Exception as e:
-            # Ignore MessageNotModifiedError - it just means the content didn't change
-            from telethon.errors.rpcerrorlist import MessageNotModifiedError
-            if not isinstance(e, MessageNotModifiedError):
-                raise
-    
-    elif data == "upload_google_token":
-        USER_STATES[user_id] = {"action": "AWAITING_GOOGLE_TOKEN"}
-        await event.edit("📤 Please upload your token.json file (authenticated Google Drive token):", buttons=[[Button.inline("❌ Cancel", data="back_to_settings")]])
 
+    elif data == "cancel_gen_session":
+        st = USER_STATES.pop(user_id, {})
+        _tmp = st.get("_tmp_client")
+        if _tmp:
+            try:
+                await _tmp.disconnect()
+            except Exception:
+                pass
+        await event.edit(
+            "❌ Session generation cancelled.",
+            buttons=[[Button.inline("◀️ Back to Settings", data="back_to_settings")]]
+        )
+
+    elif data == "gen_session_save_mongo":
+        st = USER_STATES.get(user_id, {})
+        session_string = st.get("session_string", "")
+        if not session_string:
+            await event.answer("No session found. Please run /generate_session again.", alert=True)
+            return
+        try:
+            await db["config"].update_one(
+                {"_id": "bot_settings"},
+                {"$set": {"user_session": session_string}},
+                upsert=True
+            )
+            USER_STATES.pop(user_id, None)
+            masked = session_string[:20] + "..." + session_string[-10:]
+            _ok, applied_msg = await apply_user_session_and_reconnect(session_string)
+            base = (
+                f"✅ **Session saved to MongoDB!**\n\n"
+                f"Masked: `{masked}`\n\n"
+            )
+            await event.edit(
+                base + applied_msg,
+                buttons=[[Button.inline("◀️ Back to Settings", data="back_to_settings")]],
+            )
+        except Exception as e:
+            await event.answer(f"Failed to save: {e}", alert=True)
+
+    elif data == "gen_session_send_saved":
+        st = USER_STATES.get(user_id, {})
+        session_string = st.get("session_string", "")
+        if not session_string:
+            await event.answer("No session found. Please run /generate_session again.", alert=True)
+            return
+        try:
+            await bot.send_message(
+                user_id,
+                f"🔐 **Your Telethon StringSession**\n\n"
+                f"`{session_string}`\n\n"
+                "⚠️ Keep this private. Use /settings → Manage User Session to activate it."
+            )
+            USER_STATES.pop(user_id, None)
+            await event.edit(
+                "✅ Session string sent to your **Saved Messages**.\n\n"
+                "Use /settings → Manage User Session → Set User Session to paste and activate it.",
+                buttons=[[Button.inline("◀️ Back to Settings", data="back_to_settings")]]
+            )
+        except Exception as e:
+            await event.answer(f"Failed to send: {e}", alert=True)
 
 
     elif data == "view_channels":
@@ -1438,7 +1371,7 @@ async def functional_input_processor(event: events.NewMessage.Event):
         return
 
     # Skip if it is a standard menu command
-    if event.text.startswith(("/settings", "/start", "/add_channel", "/remove_channel")):
+    if event.text.startswith(("/settings", "/start", "/add_channel", "/remove_channel", "/generate_session")):
         return
 
     state = USER_STATES.get(user_id)
@@ -1478,7 +1411,9 @@ async def functional_input_processor(event: events.NewMessage.Event):
                 {"$set": {"user_session": user_session}}
             )
             USER_STATES.pop(user_id, None)
-            await event.respond(f"✅ User session saved successfully (masked: `{user_session[:20]}...{user_session[-10:]}`). Please restart the bot for changes to take effect.")
+            _ok, applied_msg = await apply_user_session_and_reconnect(user_session)
+            base = f"✅ User session saved (masked: `{user_session[:20]}...{user_session[-10:]}`).\n\n"
+            await event.respond(base + applied_msg)
         except Exception as e:
             await event.respond(f"❌ Failed to save user session: {e}")
 
@@ -1805,182 +1740,163 @@ async def functional_input_processor(event: events.NewMessage.Event):
         USER_STATES.pop(user_id, None)
         await event.respond(f"🗑️ Removed universal exclusion: `{exclusion_to_remove}`")
     
-    elif state["action"] == "AWAITING_GOOGLE_CREDS":
-        if not event.document:
-            await event.respond("Please upload a valid JSON file.")
+
+    elif state["action"] == "AWAITING_GEN_PHONE":
+        phone = event.text.strip()
+        if not phone:
             return
-        
-        processing_msg = await event.respond("📥 Parsing credentials.json...")
-        file_path = await bot.download_media(event.document)
-        
+        from telethon.sessions import StringSession as _SS
+        from telethon.errors import FloodWaitError as _FWE
+        processing_msg = await event.respond("📡 Sending OTP to Telegram...")
         try:
-            import json
-            with open(file_path, "r", encoding="utf-8") as f:
-                creds_data = json.load(f)
-            
-            # Validate that it's a valid Google Cloud credentials file
-            if "web" not in creds_data and "installed" not in creds_data:
-                raise Exception("Invalid credentials.json file. Please provide a valid Google Cloud OAuth 2.0 client ID file.")
-            
-            # Save to database
-            await db["config"].update_one(
-                {"_id": "google_drive_creds"},
-                {"$set": {
-                    "credentials": creds_data,
-                    "already_notified_auth_issue": False  # Reset notification flag
-                }},
-                upsert=True
-            )
-
-            USER_STATES.pop(user_id, None)
+            _tmp = TelegramClient(_SS(), API_ID, API_HASH)
+            await _tmp.connect()
+            result = await _tmp.send_code_request(phone)
+            USER_STATES[user_id] = {
+                "action": "AWAITING_GEN_OTP",
+                "phone": phone,
+                "phone_code_hash": result.phone_code_hash,
+                "_tmp_client": _tmp,
+            }
             await bot.delete_messages(event.chat_id, processing_msg.id)
-            await event.respond("✅ Google Drive credentials saved successfully!")
-            
+            await event.respond(
+                "✅ OTP sent!\n\n"
+                "Enter the **OTP code** you received (just the digits, e.g. `12345`):",
+                buttons=[[Button.inline("❌ Cancel", data="cancel_gen_session")]]
+            )
+        except _FWE as e:
+            await bot.delete_messages(event.chat_id, processing_msg.id)
+            USER_STATES.pop(user_id, None)
+            await event.respond(f"⚠️ Too many attempts. Wait **{e.seconds}s** and try again.")
         except Exception as e:
-            await event.respond(f"❌ Failed to parse credentials: {e}")
-        finally:
-            # Clean up downloaded file
-            if os.path.exists(file_path):
-                os.remove(file_path)
-    
-    elif state["action"] == "AWAITING_OAUTH_CODE":
-        auth_code = event.text.strip()
-        if not auth_code:
+            await bot.delete_messages(event.chat_id, processing_msg.id)
+            USER_STATES.pop(user_id, None)
+            await event.respond(f"❌ Failed to send OTP: `{e}`")
+
+    elif state["action"] == "AWAITING_GEN_OTP":
+        code = event.text.strip()
+        if not code:
             return
-        
-        processing_msg = await event.respond("🔄 Exchanging authorization code for tokens...")
-        
-        try:
-            # Get Google OAuth credentials from DB
-            google_creds = await db["config"].find_one({"_id": "google_drive_creds"})
-            if not google_creds or not google_creds.get("credentials"):
-                raise Exception("OAuth credentials not found in database.")
-            
-            # Import necessary modules
-            from google_auth_oauthlib.flow import InstalledAppFlow
-            SCOPES = ["https://www.googleapis.com/auth/drive"]
-            import json
-            
-            # Recreate the flow with the stored code verifier
-            flow = InstalledAppFlow.from_client_config(google_creds["credentials"], SCOPES)
-            flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"  # Same redirect URI as before
-            flow.code_verifier = state.get("code_verifier")  # Use stored code verifier
-            
-            # Exchange the code for tokens
-            creds = flow.fetch_token(code=auth_code)
-            
-            # Convert credentials to a serializable dict
-            from google.oauth2.credentials import Credentials
-            credentials_obj = Credentials(
-                token=creds["access_token"],
-                refresh_token=creds.get("refresh_token"),
-                token_uri=flow.client_config["token_uri"],
-                client_id=flow.client_config["client_id"],
-                client_secret=flow.client_config["client_secret"],
-                scopes=SCOPES
-            )
-            token_data = json.loads(credentials_obj.to_json())
-            
-            # Save to database
-            await db["config"].update_one(
-                {"_id": "google_drive_creds"},
-                {"$set": {
-                    "token": token_data,
-                    "already_notified_auth_issue": False  # Reset notification flag
-                }},
-                upsert=True
-            )
-
+        _tmp  = state.get("_tmp_client")
+        phone = state.get("phone")
+        pch   = state.get("phone_code_hash")
+        if not _tmp:
+            await event.respond("❌ Session expired. Please run /generate_session again.")
             USER_STATES.pop(user_id, None)
-            await bot.delete_messages(event.chat_id, processing_msg.id)
-            await event.respond("✅ Google Drive OAuth token obtained and saved successfully!")
-            
-        except Exception as e:
-            await event.respond(f"❌ Failed to exchange authorization code: {e}\n\nPlease make sure you entered the correct code from the Google authentication page.")
-    
-    elif state["action"] == "AWAITING_SERVICE_ACCOUNT":
-        if not event.document:
-            await event.respond("Please upload a valid JSON file.")
             return
-        
-        processing_msg = await event.respond("📥 Parsing service account key...")
-        file_path = await bot.download_media(event.document)
-        
+        from telethon.errors import (
+            PhoneCodeInvalidError as _PCIE,
+            PhoneCodeExpiredError as _PCEE,
+            SessionPasswordNeededError as _SPNE,
+        )
+        processing_msg = await event.respond("🔄 Verifying OTP...")
         try:
-            import json
-            with open(file_path, "r", encoding="utf-8") as f:
-                service_account_data = json.load(f)
-            
-            # Validate that it's a valid service account file
-            required_fields = ["type", "project_id", "private_key_id", "private_key", "client_email", "client_id", "auth_uri", "token_uri", "auth_provider_x509_cert_url", "client_x509_cert_url"]
-            for field in required_fields:
-                if field not in service_account_data:
-                    raise Exception(f"Invalid service account file: missing required field '{field}'. Please provide a valid Google Cloud service account JSON key file.")
-            if service_account_data["type"] != "service_account":
-                raise Exception("Invalid file type. This doesn't look like a service account key file.")
-            
-            # Save to database
-            await db["config"].update_one(
-                {"_id": "google_drive_creds"},
-                {"$set": {
-                    "service_account": service_account_data,
-                    "already_notified_auth_issue": False  # Reset notification flag
-                }},
-                upsert=True
-            )
-
-            USER_STATES.pop(user_id, None)
+            await _tmp.sign_in(phone=phone, code=code, phone_code_hash=pch)
+            session_string = _tmp.session.save()
+            me = await _tmp.get_me()
+            await _tmp.disconnect()
+            USER_STATES[user_id] = {"action": "GEN_SESSION_READY", "session_string": session_string}
+            name_str = f" as **{me.first_name}** (@{me.username or 'no username'})" if me else ""
             await bot.delete_messages(event.chat_id, processing_msg.id)
-            await event.respond("✅ Google Drive service account key saved successfully! This is the recommended method and won't require token refreshes!\n\n💡 Important: Make sure you share your Google Drive (or the specific folder) with the service account's email address: " + service_account_data["client_email"])
-            
+            await event.respond(
+                f"✅ **Signed in{name_str}! Session generated.**\n\n"
+                "What would you like to do with it?",
+                buttons=[
+                    [Button.inline("💾 Save to MongoDB (activate on restart)", data="gen_session_save_mongo")],
+                    [Button.inline("📩 Send to my Saved Messages", data="gen_session_send_saved")],
+                    [Button.inline("❌ Cancel", data="cancel_gen_session")],
+                ]
+            )
+        except _PCIE:
+            await bot.delete_messages(event.chat_id, processing_msg.id)
+            await event.respond(
+                "❌ **Incorrect OTP.** Please try again:",
+                buttons=[[Button.inline("❌ Cancel", data="cancel_gen_session")]]
+            )
+        except _PCEE:
+            await bot.delete_messages(event.chat_id, processing_msg.id)
+            try:
+                result = await _tmp.send_code_request(phone)
+                USER_STATES[user_id]["phone_code_hash"] = result.phone_code_hash
+                await event.respond(
+                    "⚠️ OTP expired — a **new OTP** has been sent. Enter it:",
+                    buttons=[[Button.inline("❌ Cancel", data="cancel_gen_session")]]
+                )
+            except Exception as e2:
+                USER_STATES.pop(user_id, None)
+                await event.respond(f"❌ Could not resend OTP: `{e2}`")
+        except _SPNE:
+            await bot.delete_messages(event.chat_id, processing_msg.id)
+            USER_STATES[user_id]["action"] = "AWAITING_GEN_2FA"
+            await event.respond(
+                "🔒 **2FA is enabled on this account.**\n\n"
+                "Send your **2FA password**:",
+                buttons=[[Button.inline("❌ Cancel", data="cancel_gen_session")]]
+            )
         except Exception as e:
-            await event.respond(f"❌ Failed to parse service account key: {e}")
-        finally:
-            # Clean up downloaded file
-            if os.path.exists(file_path):
-                os.remove(file_path)
-    
-    elif state["action"] == "AWAITING_GOOGLE_TOKEN":
-        if not event.document:
-            await event.respond("Please upload a valid JSON file.")
+            await bot.delete_messages(event.chat_id, processing_msg.id)
+            USER_STATES.pop(user_id, None)
+            try:
+                await _tmp.disconnect()
+            except Exception:
+                pass
+            await event.respond(f"❌ Sign-in failed: `{e}`")
+
+    elif state["action"] == "AWAITING_GEN_2FA":
+        password = event.text.strip()
+        if not password:
             return
-        
-        processing_msg = await event.respond("📥 Parsing token.json...")
-        file_path = await bot.download_media(event.document)
-        
-        try:
-            import json
-            with open(file_path, "r", encoding="utf-8") as f:
-                token_data = json.load(f)
-            
-            # Validate that it's a valid Google Drive token file
-            if "token" not in token_data and "access_token" not in token_data:
-                raise Exception("Invalid token.json file. Please provide a valid Google Drive OAuth 2.0 token file.")
-            
-            # Save to database
-            await db["config"].update_one(
-                {"_id": "google_drive_creds"},
-                {"$set": {
-                    "token": token_data,
-                    "already_notified_auth_issue": False  # Reset notification flag
-                }},
-                upsert=True
-            )
-
+        _tmp = state.get("_tmp_client")
+        if not _tmp:
+            await event.respond("❌ Session expired. Please run /generate_session again.")
             USER_STATES.pop(user_id, None)
+            return
+        processing_msg = await event.respond("🔄 Verifying 2FA password...")
+        try:
+            await bot.delete_messages(event.chat_id, event.id)
+        except Exception:
+            pass
+        try:
+            await _tmp.sign_in(password=password)
+            session_string = _tmp.session.save()
+            me = await _tmp.get_me()
+            await _tmp.disconnect()
+            USER_STATES[user_id] = {"action": "GEN_SESSION_READY", "session_string": session_string}
+            name_str = f" as **{me.first_name}** (@{me.username or 'no username'})" if me else ""
             await bot.delete_messages(event.chat_id, processing_msg.id)
-            await event.respond("✅ Google Drive token saved successfully!")
-            
+            await event.respond(
+                f"✅ **2FA verified! Signed in{name_str}. Session generated.**\n\n"
+                "What would you like to do with it?",
+                buttons=[
+                    [Button.inline("💾 Save to MongoDB (activate on restart)", data="gen_session_save_mongo")],
+                    [Button.inline("📩 Send to my Saved Messages", data="gen_session_send_saved")],
+                    [Button.inline("❌ Cancel", data="cancel_gen_session")],
+                ]
+            )
         except Exception as e:
-            await event.respond(f"❌ Failed to parse token: {e}")
-        finally:
-            # Clean up downloaded file
-            if os.path.exists(file_path):
-                os.remove(file_path)
-
+            await bot.delete_messages(event.chat_id, processing_msg.id)
+            await event.respond(
+                f"❌ 2FA failed: `{e}`\n\nTry again or cancel.",
+                buttons=[[Button.inline("❌ Cancel", data="cancel_gen_session")]]
+            )
 # =====================================================================
 # AD-HOC CHANNEL MANAGEMENT COMMANDS
 # =====================================================================
+@bot.on(events.NewMessage(pattern=r"/generate_session"))
+async def generate_session_command(event: events.NewMessage.Event):
+    """Start the interactive session-generation flow via the bot."""
+    if not is_authorized(event.sender_id):
+        return
+    user_id = event.sender_id
+    USER_STATES[user_id] = {"action": "AWAITING_GEN_PHONE"}
+    await event.respond(
+        "📱 **Generate User Session**\n\n"
+        "Send your phone number **with country code** (e.g. `+911234567890`).\n\n"
+        "⚠️ An OTP will be sent to your Telegram app / SMS.",
+        buttons=[[Button.inline("❌ Cancel", data="cancel_gen_session")]]
+    )
+
+
 def normalize_channel_id(identifier):
     """Normalize any channel ID input to the standard -100xxxxxx format."""
     raw = str(identifier).strip()
@@ -2766,6 +2682,8 @@ async def incoming_stream_pipeline(event: events.NewMessage.Event):
             except Exception as e:
                 logger.error(f"Failed to send message to owner {owner}: {e}")
                 bot_activity_logger.error(f"✗ Failed to send to owner {owner}: {e}")
+
+_safe_incoming_stream_pipeline = build_safe_pipeline_wrapper(incoming_stream_pipeline)
 
 # =====================================================================
 # STARTUP CHECK: SCAN CHANNELS FOR OLD PORTFOLIO MESSAGES IF NO RECENT NEWS
@@ -3904,65 +3822,120 @@ async def send_empty_scan_text_files():
 
 
 # =====================================================================
-# MAIN RUNTIME EXECUTION ENTRY ENGINE TERMINAL OVERVIEW SETUP 
+# MAIN RUNTIME EXECUTION ENTRY ENGINE TERMINAL OVERVIEW SETUP
+# Session run + hot-reload logic lives in session.py.
+# The thin wrappers below adapt session.py's explicit-DI signatures back
+# to the implicit-global call sites used by main.py's button handlers
+# and event loop wiring.
 # =====================================================================
+
 async def user_client_run_wrapper():
-    """Wrapper for user client run loop that handles Telethon errors gracefully."""
-    from telethon.errors import PersistentTimestampOutdatedError, HistoryGetFailedError
-    while True:
-        try:
-            await user.run_until_disconnected()
-            break  # Exit loop if disconnected normally
-        except PersistentTimestampOutdatedError:
-            logger.warning("Telegram persistent timestamp outdated - continuing...")
-            await asyncio.sleep(2)  # Wait before reconnecting
-        except HistoryGetFailedError:
-            logger.warning("Telegram history fetch failed - continuing...")
-            await asyncio.sleep(2)
-        except Exception as e:
-            logger.error(f"Unexpected error in user client: {e}")
-            await asyncio.sleep(2)
+    """Backward-compat wrapper — delegates to session.py, supplying the
+    global-``user`` reference getter so hot-reloads pick up new clients."""
+    await _session_user_client_run_wrapper(lambda: user)
+
+
+async def apply_user_session_and_reconnect(new_session_str: str | None):
+    """Backward-compat wrapper — delegates to session.py's DI version.
+
+    Injects API creds + the current safe-pipeline handler + the old
+    ``user`` reference, then assigns the returned new client to the
+    global ``user`` so every other call site sees the replacement.
+
+    Returns the ``(ok, message)`` 2-tuple that main.py call sites expect.
+    """
+    global user
+    new_client, ok, msg = await _session_apply_user_session(
+        new_session_str,
+        api_id=API_ID,
+        api_hash=API_HASH,
+        safe_pipeline_coro_fn=_safe_incoming_stream_pipeline,
+        old_user_client=user,
+    )
+    user = new_client
+    return ok, msg
+
 
 async def main():
+    global user
+
     await init_db_defaults()
 
     logger.info("Starting Telegram clients...")
 
-    # Start bot client (handles commands and UI)
-    await bot.start(bot_token=BOT_TOKEN)
-    logger.info("Bot client started.")
+    # ── Start bot client first (commands + alerts always work) ──────────
+    bot_start_attempts = 0
+    while True:
+        try:
+            await bot.start(bot_token=BOT_TOKEN)
+            break
+        except Exception as bot_exc:
+            bot_start_attempts += 1
+            backoff = min(60, 2 ** min(bot_start_attempts, 6))
+            logger.critical(
+                f"[Startup] BOT CLIENT FAILED TO START (attempt {bot_start_attempts}): "
+                f"{type(bot_exc).__name__}: {bot_exc} — retrying in {backoff}s"
+            )
+            await asyncio.sleep(backoff)
+    logger.info("Bot client started successfully.")
 
-    # Load user session from DB and initialize user client
+    # ── Load user session string from DB ────────────────────────────────
     from telethon.sessions import StringSession
     config = await get_system_config()
-    user_session_str = config.get("user_session", "")
-    global user
+    user_session_str = (config or {}).get("user_session", "") or ""
+
+    # ── Initialize user client object (always, so globals resolve) ──────
     user = TelegramClient(
         StringSession(user_session_str),
         api_id=API_ID,
-        api_hash=API_HASH
+        api_hash=API_HASH,
     )
-    
-    # Start user client (reads channels the user has joined)
-    if user_session_str:
-        await user.start()
-        logger.info("User client started.")
-        # Register message handler for user client
-        user.add_event_handler(incoming_stream_pipeline, events.NewMessage())
-    else:
-        logger.warning("No user session found in DB. User client not started. Please set user session via /settings.")
 
-    # No automatic scan on deployment - scan only via /scan_old_messages command
+    user_started_ok = await start_user_client_safely(
+        user,
+        session_str=user_session_str,
+        safe_pipeline_coro_fn=_safe_incoming_stream_pipeline,
+    )
 
-    # Run clients concurrently until disconnected
+    # No automatic scan on deployment - scan only via /scan_old_messages command.
+
+    # ── Run both clients concurrently ───────────────────────────────────
+    # Always run bot.run_until_disconnected. Run user_client_run_wrapper
+    # only if we have a session string (the wrapper itself tolerates any
+    # downstream errors and exits cleanly on fatal auth errors).
     tasks = [bot.run_until_disconnected()]
-    if user_session_str:  # Only run user client if we have a session
+    if user_session_str:
         tasks.append(user_client_run_wrapper())
+
     try:
-        await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks, return_exceptions=False)
     except (KeyboardInterrupt, SystemExit):
         logger.info("Termination sequence detected. Shutting down...")
+    except Exception as gather_exc:
+        logger.critical(
+            f"[Runtime] Top-level gather raised: {type(gather_exc).__name__}: {gather_exc}"
+        )
+        # Last line of defense — keep the bot alive on the main coroutine
+        # even if the user client coroutine fatally exited; the bot can
+        # still serve /generate_session so owners can recover.
+        logger.warning("[Runtime] Keeping ONLY bot client alive for recovery commands.")
+        USER_CLIENT_STATUS["connected"] = False
+        USER_CLIENT_STATUS["last_error"] = f"Runtime gather: {type(gather_exc).__name__}: {gather_exc}"
+        try:
+            await notify_owners_about_user_client_error(
+                f"Runtime user client exited: {type(gather_exc).__name__}: {gather_exc}",
+                classify_user_client_error(gather_exc),
+            )
+        except Exception:
+            pass
+        try:
+            await bot.run_until_disconnected()
+        except Exception as final_bot_exc:
+            logger.critical(f"[Runtime] Even bot client exited: {final_bot_exc}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.getLogger(__name__).info("Interrupted by user at top level.")

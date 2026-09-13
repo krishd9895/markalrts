@@ -3,11 +3,15 @@ services:
     build: .
     restart: unless-stopped
     hostname: ${NODE_LABEL:-}
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     ports:
-      - "5090:5090"
+      - "${WEBSERVER_PORT:-5090}:${WEBSERVER_PORT:-5090}"
     volumes:
       - ./.env:/app/.env:ro
       # Optional: Mount logs for persistence
       - ./logs:/app/logs
     environment:
       - TZ=Asia/Kolkata
+      - WEBSERVER_PORT=${WEBSERVER_PORT:-5090}

@@ -1,0 +1,78 @@
+# ── Python bytecode / caches ────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ── Virtual environments ───────────────────────────────────────────
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# ── Jupyter / notebook ─────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Pytest / coverage / mypy ───────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# ── IDE / editor ───────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Project: secrets & env ─────────────────────────────────────────
+.env
+.env.local
+.env.prod
+.env.production
+.trae/
+
+# ── Project: logs & runtime state ──────────────────────────────────
+*.log
+logs/
+*.session
+*.session-journal
+market_intel_bot.session
+market_intel_bot.session-journal
+
+# ── Project: OCR / temp artefacts ──────────────────────────────────
+temp_images/
+tmp/
+*.tmp
+
+# ── Docker / compose local overrides ───────────────────────────────
+docker-compose.override.yml
