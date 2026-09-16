@@ -43,6 +43,8 @@ from telethon.errors.rpcerrorlist import UnauthorizedError
 
 load_dotenv()
 
+bot_activity_logger = logging.getLogger("bot_activity")
+
 # =========================================================================
 # FAILOVER NODE IDENTITY  (read from env vars injected by failover.py)
 # =========================================================================
@@ -348,7 +350,7 @@ async def is_this_node_the_session_leader() -> tuple[bool, str]:
         # Can't verify — allow by default so bot doesn't get stuck.
         return True, "failover-config-missing"
 
-    _log = logging.getLogger(__name__)
+    _log = bot_activity_logger
     try:
         import pymongo
         client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=4000)
@@ -461,7 +463,7 @@ async def notify_owners_about_user_client_error(
     )
 
     if same_error:
-        logging.getLogger(__name__).info(
+        bot_activity_logger.info(
             "[UserClient-Error] Suppressing duplicate owner alert "
             "(same error within %s cooldown): %s…",
             cooldown, error_msg[:80],
@@ -516,7 +518,7 @@ async def notify_owners_about_user_client_error(
             "If this keeps happening, run `/generate_session` to refresh the user session.\n"
         )
 
-    logger = logging.getLogger(__name__)
+    logger = bot_activity_logger
     logger.error("[UserClient-Error] Notifying owners: %s", error_msg)
     for owner in owners:
         try:
@@ -548,7 +550,7 @@ def build_safe_pipeline_wrapper(real_pipeline_coro_fn):
         _safe = build_safe_pipeline_wrapper(incoming_stream_pipeline)
         user.add_event_handler(_safe, events.NewMessage())
     """
-    channel_logger = logging.getLogger("channel")
+    channel_logger = logging.getLogger("channel_activity")
 
     async def _safe_wrapper(event):
         try:
@@ -557,7 +559,7 @@ def build_safe_pipeline_wrapper(real_pipeline_coro_fn):
             chat_id = getattr(event, "chat_id", "?")
             msg_id  = getattr(event, "id", "?")
             err_str = f"{type(pipe_exc).__name__}: {pipe_exc}"
-            logging.getLogger(__name__).error(
+            bot_activity_logger.error(
                 "[Pipeline] Uncaught error processing msg chat=%s id=%s: %s\n%s",
                 chat_id, msg_id, err_str, _tb.format_exc(),
             )
@@ -616,11 +618,11 @@ async def apply_user_session_and_reconnect(
                 pass
             if old_user_client.is_connected():
                 await old_user_client.disconnect()
-                logging.getLogger(__name__).info(
+                bot_activity_logger.info(
                     "[SessionReload] Old user client disconnected."
                 )
         except Exception as disc_exc:
-            logging.getLogger(__name__).warning(
+            bot_activity_logger.warning(
                 "[SessionReload] Disconnect of old client noisy: %s", disc_exc
             )
 
@@ -638,7 +640,7 @@ async def apply_user_session_and_reconnect(
     if not new_session_str:
         USER_CLIENT_STATUS["connected"]  = False
         USER_CLIENT_STATUS["last_error"] = "Session explicitly cleared by operator"
-        logging.getLogger(__name__).info(
+        bot_activity_logger.info(
             "[SessionReload] Session cleared; user client disabled."
         )
         return (
@@ -648,7 +650,7 @@ async def apply_user_session_and_reconnect(
         )
 
     # ── 3. Start + validate the freshly-built client ──────────────────
-    logging.getLogger(__name__).info(
+    bot_activity_logger.info(
         "[SessionReload] Attempting to start user client with freshly saved session..."
     )
     try:
@@ -660,7 +662,7 @@ async def apply_user_session_and_reconnect(
         name  = getattr(me, "first_name", "?") if me else "?"
         uname = getattr(me, "username", None)   if me else None
         who   = f"{name} (@{uname})" if uname else name
-        logging.getLogger(__name__).info(
+        bot_activity_logger.info(
             "[SessionReload] User client reconnected as %s. No restart needed.", who
         )
         return (
@@ -677,7 +679,7 @@ async def apply_user_session_and_reconnect(
         err_str = f"{type(auth_exc).__name__}: {auth_exc}"
         USER_CLIENT_STATUS["connected"]  = False
         USER_CLIENT_STATUS["last_error"] = err_str
-        logging.getLogger(__name__).critical(
+        bot_activity_logger.critical(
             "[SessionReload] Saved session rejected (%s): %s", etype, err_str
         )
         # Notify immediately — operator just tried to save a broken session.
@@ -700,7 +702,7 @@ async def apply_user_session_and_reconnect(
         wait_s = int(getattr(fw_exc, "seconds", 60))
         USER_CLIENT_STATUS["connected"]  = False
         USER_CLIENT_STATUS["last_error"] = f"FloodWait after reload: {wait_s}s"
-        logging.getLogger(__name__).warning("[SessionReload] FloodWait %ss", wait_s)
+        bot_activity_logger.warning("[SessionReload] FloodWait %ss", wait_s)
         return (
             new_client,
             False,
@@ -715,7 +717,7 @@ async def apply_user_session_and_reconnect(
         err_str = f"{type(reload_exc).__name__}: {reload_exc}"
         USER_CLIENT_STATUS["connected"]  = False
         USER_CLIENT_STATUS["last_error"] = err_str
-        logging.getLogger(__name__).error(
+        bot_activity_logger.error(
             "[SessionReload] Apply failed: %s\n%s", err_str, _tb.format_exc()
         )
         try:
@@ -755,7 +757,7 @@ async def start_user_client_safely(
     if not session_str:
         USER_CLIENT_STATUS["connected"]  = False
         USER_CLIENT_STATUS["last_error"] = "No user_session stored in MongoDB"
-        logging.getLogger(__name__).warning(
+        bot_activity_logger.warning(
             "[Startup] No user session found in DB. User client NOT started. "
             "Owner must run /generate_session."
         )
@@ -764,7 +766,7 @@ async def start_user_client_safely(
                 "No user session configured at startup", "no_session",
             )
         except Exception as notify_err:
-            logging.getLogger(__name__).error(
+            bot_activity_logger.error(
                 "[Startup] Owner notification (no session) failed: %s", notify_err
             )
         return False
@@ -774,7 +776,7 @@ async def start_user_client_safely(
     if not allowed:
         USER_CLIENT_STATUS["connected"]  = False
         USER_CLIENT_STATUS["last_error"] = f"Not the session leader: {reason}"
-        logging.getLogger(__name__).warning(
+        bot_activity_logger.warning(
             "[Startup] SKIPPING user client start — this node is NOT the current "
             "leader. Reason: %s  "
             "The bot will continue without channel reading. "
@@ -784,14 +786,14 @@ async def start_user_client_safely(
         # Do NOT notify owners here — this is normal standby behaviour.
         return False
 
-    logging.getLogger(__name__).info(
+    bot_activity_logger.info(
         "[Startup] User session string found. Attempting to start user client..."
     )
     try:
         await existing_user_client.start()
         me = await existing_user_client.get_me()
         if me:
-            logging.getLogger(__name__).info(
+            bot_activity_logger.info(
                 "[Startup] User client started as %s (@%s, id=%s)",
                 me.first_name, me.username or "no username", me.id,
             )
@@ -807,7 +809,7 @@ async def start_user_client_safely(
         USER_CLIENT_STATUS["connected"]            = False
         USER_CLIENT_STATUS["last_error"]           = err_str
         USER_CLIENT_STATUS["consecutive_failures"] = 1
-        logging.getLogger(__name__).critical(
+        bot_activity_logger.critical(
             "[Startup] USER CLIENT AUTH FAILURE (%s): %s. "
             "Bot will continue running without the user client.",
             etype, err_str,
@@ -815,7 +817,7 @@ async def start_user_client_safely(
         try:
             await notify_owners_about_user_client_error(err_str, etype)
         except Exception as notify_err:
-            logging.getLogger(__name__).error(
+            bot_activity_logger.error(
                 "[Startup] Owner notification (auth fail) failed: %s", notify_err
             )
         return False
@@ -823,7 +825,7 @@ async def start_user_client_safely(
         wait_s = int(getattr(fw_exc, "seconds", 60))
         USER_CLIENT_STATUS["connected"]  = False
         USER_CLIENT_STATUS["last_error"] = f"FloodWait during startup: {wait_s}s"
-        logging.getLogger(__name__).warning(
+        bot_activity_logger.warning(
             "[Startup] User client blocked by FloodWaitError (%ss). "
             "Bot continues, user client will be retried via the run wrapper.",
             wait_s,
@@ -843,7 +845,7 @@ async def start_user_client_safely(
         USER_CLIENT_STATUS["connected"]            = False
         USER_CLIENT_STATUS["last_error"]           = err_str
         USER_CLIENT_STATUS["consecutive_failures"] = 1
-        logging.getLogger(__name__).error(
+        bot_activity_logger.error(
             "[Startup] USER CLIENT START FAILED (%s): %s. "
             "Bot continues, user client will be retried via the run wrapper.",
             etype, err_str,
@@ -851,7 +853,7 @@ async def start_user_client_safely(
         try:
             await notify_owners_about_user_client_error(err_str, etype)
         except Exception as notify_err:
-            logging.getLogger(__name__).error(
+            bot_activity_logger.error(
                 "[Startup] Owner notification (generic) failed: %s", notify_err
             )
         return False
@@ -899,7 +901,7 @@ async def user_client_run_wrapper(
     This eliminates ``AuthKeyDuplicatedError`` caused by two nodes sharing
     the same StringSession simultaneously.
     """
-    logger = logging.getLogger(__name__)
+    logger = bot_activity_logger
     retry_count = 0
     max_retries_before_alert = 5
     # How often (seconds) to re-check leader status while in standby-wait.
