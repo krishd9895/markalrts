@@ -86,36 +86,143 @@ OS_INFO = f"{platform.system()} {platform.release()}"
 PYTHON_VERSION = platform.python_version()
 
 # ---------------------------------------------------------------------------
-# LEADER IP ADDRESS RESOLUTION
-# Stores the outbound IP that Telegram will see so session.py can compare
-# it against the currently-active leader's IP and refuse to start a second
-# Telethon user client from a non-leader node.
+# LEADER NODE IDENTITY - PUBLIC/EXTERNAL IP RESOLUTION
+#
+# IMPORTANT SAFETY NOTE:  node_ip is ONLY used for human-facing diagnostic
+# text (logs, /stats output).  The actual leader-election uniqueness key
+# is the UUID node_id (NODE_ID).  We MUST never use an IP as a uniqueness
+# signal because:
+#   * 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 are RFC-1918 private LAN
+#     ranges and are NOT unique across physical hosts.
+#   * Docker/WSL default bridge always assigns 10.x.x.x to every container
+#     on every host — a different node still gets a 10.x address.
+#   * Two different real machines behind two different NAT gateways can
+#     both have the same private LAN IP (e.g. both 192.168.1.100) but
+#     expose two different public IPs to Telegram.
+#
+# The consequence of confusing "private IP" with "unique node identity" is
+# AuthKeyDuplicatedError — the exact bug the user is currently hitting.
+# Therefore this function tries HARD to return the TRUE public/external IP
+# that Telegram's backend actually sees, and the fallback (private LAN IP)
+# is explicitly tagged as non-unique so downstream displays can warn.
 # ---------------------------------------------------------------------------
+_PRIVATE_IP_PREFIXES = (
+    "10.",
+    "192.168.",
+    "172.16.", "172.17.", "172.18.", "172.19.", "172.20.",
+    "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
+    "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.",
+    "127.",
+    "169.254.",  # link-local / APIPA (docker when no network)
+    "::1",       # IPv6 loopback
+    "fe80:",     # IPv6 link-local
+)
+_EXTERNAL_IP_SERVICES = (
+    # Simple, well-known, rate-limit-friendly "what's my IP" plaintext HTTP APIs.
+    # Each is tried in order; the first 200 response with a valid-looking IP wins.
+    ("https://api.ipify.org",               3.0),
+    ("https://ifconfig.me/ip",              3.0),
+    ("https://icanhazip.com",               3.0),
+    ("https://checkip.amazonaws.com",       3.0),
+)
+
+
+def _is_private_or_link_local_ip(ip: str) -> bool:
+    """Return True if the IP is in any RFC-1918 private / loopback / link-local range."""
+    if not ip:
+        return True
+    ip = ip.strip()
+    return any(ip.startswith(pfx) for pfx in _PRIVATE_IP_PREFIXES)
+
+
 def resolve_node_ip() -> str:
     """
-    Best-effort outbound IP (the IP this machine uses to reach the internet /
-    MongoDB).  Falls back to '127.0.0.1' rather than crashing.
+    Return the TRUE public/external IP address that external services
+    (Telegram, MongoDB Atlas) will actually see this node as.
+
+    Resolution order (each step only runs if the prior step produced a
+    non-unique / private IP or failed):
+
+      1. NODE_IP .env override — trusted, returned as-is.
+      2. UDP outbound-interface trick (LAN side, often 10.x / 192.168.x) —
+         useful as a last-resort diagnostic but NOT unique.
+      3. Hostname resolution (usually 127.x / Docker bridge / 10.x).
+      4. External HTTP service probe — the ONLY method that returns a
+         genuinely unique public IP; run ONLY if (2) and (3) both gave us
+         a private/non-unique address.
+
+    Return value is *never* empty; worst case it is the best-effort private
+    LAN IP which downstream code MUST label "non-unique private LAN" in any
+    user-facing diagnostic text.
     """
-    # 1. Explicit override via .env — useful in NAT / VPN / Docker environments.
+
+    # 1. Explicit operator override via .env — always trusted as-is.
     explicit_ip = os.getenv("NODE_IP", "").strip()
     if explicit_ip:
         return explicit_ip
-    # 2. UDP trick: open a socket toward a public address without actually
-    #    sending any data — the OS chooses the outbound interface.
+
+    # 2. UDP trick: open a socket toward a public address without sending
+    #    any real packet — the kernel returns the bound outbound interface.
+    best_effort_lan_ip = ""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.settimeout(2)
             s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
+            best_effort_lan_ip = s.getsockname()[0]
     except Exception:
         pass
-    # 3. Hostname-based fallback.
-    try:
-        return socket.gethostbyname(socket.gethostname())
-    except Exception:
-        return "127.0.0.1"
+
+    # 3. Hostname resolution fallback (can also give 127.0.0.1 or private LAN).
+    if not best_effort_lan_ip:
+        try:
+            best_effort_lan_ip = socket.gethostbyname(socket.gethostname())
+        except Exception:
+            best_effort_lan_ip = "127.0.0.1"
+
+    # If (2)/(3) already returned a genuine public IP (rare but possible
+    # on bare-metal machines with a directly-routed interface), return it.
+    if not _is_private_or_link_local_ip(best_effort_lan_ip):
+        return best_effort_lan_ip
+
+    # 4. All local methods gave us a non-unique private LAN IP. Try hard
+    #    to find the real public-facing IP via HTTP so operators reading
+    #    logs and /stats can actually tell two different physical hosts
+    #    apart when both have "10.0.1.2" as their container LAN side.
+    import urllib.request as _urlreq
+    import re as _re
+    _ipv4_re = _re.compile(r"^\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s*$")
+
+    for url, timeout_s in _EXTERNAL_IP_SERVICES:
+        try:
+            req = _urlreq.Request(url, headers={"User-Agent": "markalrts-failover-watchdog/1.0"})
+            with _urlreq.urlopen(req, timeout=timeout_s) as resp:
+                if resp.status != 200:
+                    continue
+                body = resp.read(256).decode("ascii", errors="ignore")
+                m = _ipv4_re.match(body)
+                if not m:
+                    continue
+                pub_ip = m.group(1)
+                octets = pub_ip.split(".")
+                if not all(0 <= int(o) <= 255 for o in octets):
+                    continue
+                if _is_private_or_link_local_ip(pub_ip):
+                    # Extremely unlikely for an external service to return
+                    # a private IP, but guard anyway.
+                    continue
+                return pub_ip
+        except Exception:
+            # External probe failed (offline host, no internet, blocked egress,
+            # etc). Try the next service; if none work, fall back to the LAN IP.
+            continue
+
+    # Could not determine a real public IP — best we can do is the LAN-side
+    # address.  /stats MUST label this as non-unique private LAN.
+    return best_effort_lan_ip
+
 
 NODE_IP = resolve_node_ip()
+IS_NODE_IP_PRIVATE_LAN = _is_private_or_link_local_ip(NODE_IP)
 
 
 PROJECT_PATH = os.path.dirname(os.path.abspath(__file__))
@@ -886,6 +993,7 @@ def main():
                         child_env["FAILOVER_NODE_ID"]      = NODE_ID
                         child_env["FAILOVER_NODE_ALIAS"]   = NODE_ALIAS
                         child_env["FAILOVER_NODE_IP"]      = NODE_IP
+                        child_env["FAILOVER_NODE_IP_IS_PRIVATE_LAN"] = "1" if IS_NODE_IP_PRIVATE_LAN else "0"
                         child_env["FAILOVER_SERVICE_ID"]   = SERVICE_ID
                         child_env["FAILOVER_DB_NAME"]      = DATABASE_NAME
                         child_env["FAILOVER_COLLECTION"]   = COLLECTION_NAME

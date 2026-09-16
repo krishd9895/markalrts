@@ -795,8 +795,28 @@ async def stats_command_handler(event: events.NewMessage.Event):
     import socket
     import time as _time
 
+    # ── Private-IP detection helpers (MUST match session.py / failover.py)
+    _PRIVATE_IP_PREFIXES = (
+        "10.", "192.168.",
+        "172.16.", "172.17.", "172.18.", "172.19.", "172.20.",
+        "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
+        "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.",
+        "127.", "169.254.",
+        "::1", "fe80:",
+    )
+
+    def _is_private_ip(ip: str) -> bool:
+        if not ip:
+            return True
+        ip = ip.strip()
+        return any(ip.startswith(pfx) for pfx in _PRIVATE_IP_PREFIXES)
+
     # ── IP addresses ────────────────────────────────────────────────
     # Outbound IP (what external services like Telegram see)
+    #   NOTE: The UDP trick below returns the *local/lan* outbound interface
+    #   IP, NOT the real public IP. This is almost always 10.x in Docker/WSL
+    #   and is NOT unique across nodes. We keep it for diagnostics but label
+    #   it explicitly. The TRUE unique-per-node identifier is the UUID node_id.
     def _outbound_ip() -> str:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -806,7 +826,7 @@ async def stats_command_handler(event: events.NewMessage.Event):
         except Exception:
             return "unavailable"
 
-    # All local IPs bound to this machine
+    # All local IPs bound to this machine (RFC-1918 private LAN, never unique)
     def _local_ips() -> list[str]:
         try:
             hostname = socket.gethostname()
@@ -818,7 +838,9 @@ async def stats_command_handler(event: events.NewMessage.Event):
             return ["unavailable"]
 
     outbound_ip = _outbound_ip()
-    local_ips   = ", ".join(_local_ips())
+    outbound_ip_is_private = _is_private_ip(outbound_ip)
+    local_ips_list = _local_ips()
+    local_ips_str = ", ".join(local_ips_list)
 
     # ── Failover / HA identity (injected by failover.py as env vars) ──
     failover_node_id    = os.getenv("FAILOVER_NODE_ID", "")
@@ -826,6 +848,14 @@ async def stats_command_handler(event: events.NewMessage.Event):
     failover_node_ip    = os.getenv("FAILOVER_NODE_IP", "")
     failover_service_id = os.getenv("FAILOVER_SERVICE_ID", "")
     is_under_failover   = bool(failover_node_id)
+    # failover.py tags each child with this flag so we don't re-run detection.
+    _env_flag = os.getenv("FAILOVER_NODE_IP_IS_PRIVATE_LAN", "")
+    if _env_flag == "1":
+        failover_ip_is_private = True
+    elif _env_flag == "0":
+        failover_ip_is_private = False
+    else:
+        failover_ip_is_private = _is_private_ip(failover_node_ip)
 
     # ── CPU & memory (psutil — optional) ───────────────────────────
     cpu_line = "psutil not installed"
@@ -895,10 +925,21 @@ async def stats_command_handler(event: events.NewMessage.Event):
         f"`{now_ist}`",
         "",
         "**🌐 Network**",
-        f"  Outbound IP (Telegram sees) : `{outbound_ip}`",
-        f"  Local IPs                   : `{local_ips}`",
-        f"  Hostname                    : `{hostname}`",
     ]
+    if outbound_ip_is_private:
+        # 10.x / 192.168.x / 172.16-31.x — not unique per node.
+        lines.append(
+            f"  Outbound IF (LAN-side)      : `{outbound_ip}`  ⚠️ PRIVATE LAN — not unique across nodes"
+        )
+        lines.append(
+            "  (True public IP is only available after failover.py probes an external service.)"
+        )
+    else:
+        lines.append(f"  Outbound IP (Telegram sees) : `{outbound_ip}`")
+    lines.append(
+        f"  Local IPs (private LAN)     : `{local_ips_str}`  ℹ️ RFC-1918 — never unique per node"
+    )
+    lines.append(f"  Hostname                    : `{hostname}`")
 
     if is_under_failover:
         lines += [
@@ -906,8 +947,21 @@ async def stats_command_handler(event: events.NewMessage.Event):
             "**🔁 HA Failover**",
             f"  Service ID  : `{failover_service_id}`",
             f"  Node alias  : `{failover_node_alias}`",
-            f"  Node IP     : `{failover_node_ip}`",
-            f"  Node ID     : `{failover_node_id[:24]}…`",
+        ]
+        if failover_node_ip:
+            if failover_ip_is_private:
+                lines.append(
+                    f"  Node IP     : `{failover_node_ip}`  ⚠️ PRIVATE LAN — NOT a uniqueness key"
+                )
+            else:
+                lines.append(f"  Node IP     : `{failover_node_ip}`")
+        else:
+            lines.append("  Node IP     : `n/a`")
+        # UUID node_id is the ACTUAL single-source-of-truth uniqueness key.
+        # The private 10.x "Node IP" field is diagnostic only and can be
+        # duplicated across different physical machines behind NAT.
+        lines += [
+            f"  Node ID ⚠️   : `{failover_node_id[:24]}…`  ← **only this guarantees uniqueness**",
         ]
     else:
         lines += [

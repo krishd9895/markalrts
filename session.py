@@ -46,6 +46,42 @@ load_dotenv()
 bot_activity_logger = logging.getLogger("bot_activity")
 
 # =========================================================================
+# PRIVATE LAN IP DETECTION (shared helper — MUST match failover.py)
+# =========================================================================
+# Private/link-local IP ranges that are NOT unique across physical nodes
+# (every Docker/WSL container on every host gets a 10.x.x.x by default).
+# The ACTUAL uniqueness key for leader election is the UUID NODE_ID.
+# These helpers exist ONLY to prevent misleading diagnostic text.
+_PRIVATE_IP_PREFIXES = (
+    "10.",
+    "192.168.",
+    "172.16.", "172.17.", "172.18.", "172.19.", "172.20.",
+    "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
+    "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.",
+    "127.",
+    "169.254.",
+    "::1", "fe80:",
+)
+
+
+def _is_private_or_link_local_ip(ip: str) -> bool:
+    """Return True if ip is in a private/loopback/link-local (non-unique) range."""
+    if not ip:
+        return True
+    ip = ip.strip()
+    return any(ip.startswith(pfx) for pfx in _PRIVATE_IP_PREFIXES)
+
+
+def _ip_for_logs(ip: str, *, with_warning: bool = True) -> str:
+    """Render an IP for logs. Private LAN IPs get an explicit non-unique tag."""
+    if not ip or _is_private_or_link_local_ip(ip):
+        if with_warning:
+            return f"{ip or 'unknown'}  ⚠️ PRIVATE LAN — NOT unique per node"
+        return f"{ip or 'unknown'} (private LAN, not unique)"
+    return ip
+
+
+# =========================================================================
 # FAILOVER NODE IDENTITY  (read from env vars injected by failover.py)
 # =========================================================================
 # When failover.py is in use it passes node identity as environment
@@ -60,6 +96,9 @@ bot_activity_logger = logging.getLogger("bot_activity")
 # IMPORTANT: failover.py is NEVER imported here.  Importing it would run
 # its top-level code (MongoDB pool, keep_alive, watchdog state) inside the
 # child process, which would break everything.
+#
+# SAFETY:  The ONLY reliable uniqueness key in this dict is node_id (UUID).
+#          node_ip is diagnostic display ONLY — never use it for equality.
 # =========================================================================
 def _get_failover_identity() -> dict | None:
     """
@@ -70,10 +109,19 @@ def _get_failover_identity() -> dict | None:
     service_id = os.getenv("FAILOVER_SERVICE_ID", "").strip()
     if not node_id or not service_id:
         return None   # not running under failover
+    ip_raw = os.getenv("FAILOVER_NODE_IP", "")
+    ip_is_private_env = os.getenv("FAILOVER_NODE_IP_IS_PRIVATE_LAN", "")
+    if ip_is_private_env == "1":
+        ip_is_private = True
+    elif ip_is_private_env == "0":
+        ip_is_private = False
+    else:
+        ip_is_private = _is_private_or_link_local_ip(ip_raw)
     return {
         "node_id":          node_id,
         "node_alias":       os.getenv("FAILOVER_NODE_ALIAS", ""),
-        "node_ip":          os.getenv("FAILOVER_NODE_IP", ""),
+        "node_ip":          ip_raw,
+        "node_ip_is_private_lan": ip_is_private,
         "service_id":       service_id,
         "database_name":    os.getenv("FAILOVER_DB_NAME", "Failover"),
         "collection_name":  os.getenv("FAILOVER_COLLECTION", "Services"),
@@ -363,6 +411,7 @@ async def is_this_node_the_session_leader() -> tuple[bool, str]:
 
         current_leader = doc.get("current_leader", {})
         leader_node_id = current_leader.get("node_id")
+        leader_node_alias = current_leader.get("node_alias", "?")
         leader_node_ip = current_leader.get("node_ip", "")
         last_heartbeat = current_leader.get("last_heartbeat")
 
@@ -382,20 +431,32 @@ async def is_this_node_the_session_leader() -> tuple[bool, str]:
             return True, "leader-expired-or-absent"
 
         if leader_node_id == node_id:
-            # This node IS the leader.
-            return True, f"this-node-is-leader ip={node_ip}"
+            # This node IS the leader — the UUID node_id is the only authoritative key.
+            return True, f"this-node-is-leader node={node_alias or node_id[:12]}"
 
         # Another node is the active leader.
+        #
+        # IMPORTANT: We ONLY compare leader_node_id (UUID) above — never compare IPs
+        # for uniqueness because the same 10.x.x.x private LAN address can appear on
+        # two different physical hosts behind NAT and cause the guard to be wrong.
+        # The IPs below are logged purely for diagnostic display; they carry no
+        # authority in this function.
         _log.warning(
             "[SessionGuard] Another node holds the leader lease "
-            "(leader_node_alias=%s, leader_ip=%s). "
+            "(leader_node_alias=%s, leader_node_id=%s, leader_ip=%s). "
             "User client will NOT be started on this node to avoid "
             "AuthKeyDuplicatedError.",
-            current_leader.get("node_alias", "?"), leader_node_ip,
+            leader_node_alias,
+            (leader_node_id or "?")[:16] + "…" if leader_node_id and len(leader_node_id) > 16 else (leader_node_id or "?"),
+            _ip_for_logs(leader_node_ip),
         )
+        if leader_node_alias and leader_node_alias != "?":
+            return False, (
+                f"standby-node — leader is '{leader_node_alias}'"
+            )
         return False, (
-            f"standby-node — leader is {current_leader.get('node_alias', '?')} "
-            f"at ip={leader_node_ip}"
+            f"standby-node — leader node_id="
+            f"{(leader_node_id or 'unknown')[:20]}{'…' if leader_node_id and len(leader_node_id) > 20 else ''}"
         )
 
     except Exception as guard_exc:
