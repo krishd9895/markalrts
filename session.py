@@ -44,6 +44,43 @@ from telethon.errors.rpcerrorlist import UnauthorizedError
 load_dotenv()
 
 # =========================================================================
+# FAILOVER NODE IDENTITY  (read from env vars injected by failover.py)
+# =========================================================================
+# When failover.py is in use it passes node identity as environment
+# variables to the child process (main.py).  session.py reads them here
+# so it can verify this node is the elected leader before starting the
+# Telethon user client — preventing AuthKeyDuplicatedError from two nodes
+# sharing the same session simultaneously.
+#
+# If the env vars are absent (single-node, no failover.py) every guard
+# check returns True automatically — zero behavioural change.
+#
+# IMPORTANT: failover.py is NEVER imported here.  Importing it would run
+# its top-level code (MongoDB pool, keep_alive, watchdog state) inside the
+# child process, which would break everything.
+# =========================================================================
+def _get_failover_identity() -> dict | None:
+    """
+    Return the HA node identity injected by failover.py as env vars, or
+    None if this process was not started by failover (single-node mode).
+    """
+    node_id    = os.getenv("FAILOVER_NODE_ID", "").strip()
+    service_id = os.getenv("FAILOVER_SERVICE_ID", "").strip()
+    if not node_id or not service_id:
+        return None   # not running under failover
+    return {
+        "node_id":          node_id,
+        "node_alias":       os.getenv("FAILOVER_NODE_ALIAS", ""),
+        "node_ip":          os.getenv("FAILOVER_NODE_IP", ""),
+        "service_id":       service_id,
+        "database_name":    os.getenv("FAILOVER_DB_NAME", "Failover"),
+        "collection_name":  os.getenv("FAILOVER_COLLECTION", "Services"),
+        "heartbeat_timeout": int(os.getenv("FAILOVER_HB_TIMEOUT", "60")),
+    }
+
+_FAILOVER_IDENTITY: dict | None = _get_failover_identity()
+
+# =========================================================================
 # STANDALONE-CLI CONFIG
 # =========================================================================
 # These values are ONLY used for the `python session.py` CLI.
@@ -278,8 +315,96 @@ health across the bot command surface.
 
 
 # -------------------------------------------------------------------------
-# C. Owner-notification helper
+# B2. Leader-node guard — prevents session conflict across HA nodes
 # -------------------------------------------------------------------------
+
+async def is_this_node_the_session_leader() -> tuple[bool, str]:
+    """
+    Check MongoDB to confirm that *this* process is the current elected
+    leader before allowing the Telethon user client to connect.
+
+    Returns
+    -------
+    (allowed: bool, reason: str)
+        allowed=True  → this node is the leader (or failover is not in use)
+        allowed=False → another node is the active leader; do NOT start the
+                        user client here or Telegram will kill both sessions
+                        with AuthKeyDuplicatedError.
+    """
+    if _FAILOVER_IDENTITY is None:
+        # failover.py is not in use — single-node deployment, always allowed.
+        return True, "no-failover"
+
+    node_id       = _FAILOVER_IDENTITY.get("node_id")
+    node_alias    = _FAILOVER_IDENTITY.get("node_alias")
+    node_ip       = _FAILOVER_IDENTITY.get("node_ip", "unknown")
+    service_id    = _FAILOVER_IDENTITY.get("service_id")
+    db_name       = _FAILOVER_IDENTITY.get("database_name")
+    coll_name     = _FAILOVER_IDENTITY.get("collection_name")
+    hb_timeout    = _FAILOVER_IDENTITY.get("heartbeat_timeout", 60)
+    mongo_uri     = os.getenv("MONGO_URI", "")
+
+    if not mongo_uri or not service_id:
+        # Can't verify — allow by default so bot doesn't get stuck.
+        return True, "failover-config-missing"
+
+    _log = logging.getLogger(__name__)
+    try:
+        import pymongo
+        client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=4000)
+        doc = client[db_name][coll_name].find_one({"_id": service_id})
+        client.close()
+
+        if not doc:
+            # No record yet — we are probably the very first node bootstrapping.
+            return True, "no-leader-record"
+
+        current_leader = doc.get("current_leader", {})
+        leader_node_id = current_leader.get("node_id")
+        leader_node_ip = current_leader.get("node_ip", "")
+        last_heartbeat = current_leader.get("last_heartbeat")
+
+        # Check if the leader record is still fresh (within heartbeat timeout).
+        leader_alive = False
+        if last_heartbeat:
+            try:
+                if last_heartbeat.tzinfo is None:
+                    last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
+                elapsed = (datetime.now(timezone.utc) - last_heartbeat).total_seconds()
+                leader_alive = elapsed < hb_timeout
+            except Exception:
+                leader_alive = False
+
+        if not leader_alive:
+            # No active leader — allow this node to attempt.
+            return True, "leader-expired-or-absent"
+
+        if leader_node_id == node_id:
+            # This node IS the leader.
+            return True, f"this-node-is-leader ip={node_ip}"
+
+        # Another node is the active leader.
+        _log.warning(
+            "[SessionGuard] Another node holds the leader lease "
+            "(leader_node_alias=%s, leader_ip=%s). "
+            "User client will NOT be started on this node to avoid "
+            "AuthKeyDuplicatedError.",
+            current_leader.get("node_alias", "?"), leader_node_ip,
+        )
+        return False, (
+            f"standby-node — leader is {current_leader.get('node_alias', '?')} "
+            f"at ip={leader_node_ip}"
+        )
+
+    except Exception as guard_exc:
+        _log.warning(
+            "[SessionGuard] Could not verify leader identity (%s). "
+            "Allowing user client start as a safe fallback.",
+            guard_exc,
+        )
+        return True, f"guard-check-failed: {guard_exc}"
+
+
 
 async def notify_owners_about_user_client_error(
     error_msg: str,
@@ -644,6 +769,21 @@ async def start_user_client_safely(
             )
         return False
 
+    # ── Leader guard: only start the Telethon user client on the elected leader node ──
+    allowed, reason = await is_this_node_the_session_leader()
+    if not allowed:
+        USER_CLIENT_STATUS["connected"]  = False
+        USER_CLIENT_STATUS["last_error"] = f"Not the session leader: {reason}"
+        logging.getLogger(__name__).warning(
+            "[Startup] SKIPPING user client start — this node is NOT the current "
+            "leader. Reason: %s  "
+            "The bot will continue without channel reading. "
+            "When this node becomes leader it will start the user client automatically.",
+            reason,
+        )
+        # Do NOT notify owners here — this is normal standby behaviour.
+        return False
+
     logging.getLogger(__name__).info(
         "[Startup] User session string found. Attempting to start user client..."
     )
@@ -741,12 +881,63 @@ async def user_client_run_wrapper(
         would keep using the old disconnected client.
     notify_owners_on_error : bool
         Disable in tests.
+
+    Leader-guard behaviour
+    ----------------------
+    In a multi-node HA deployment (failover.py) only the **elected leader**
+    is allowed to hold an active Telethon user session.  Every heartbeat
+    cycle this wrapper checks MongoDB to confirm:
+
+    * If this node is the leader → proceed normally.
+    * If another node is the leader and its heartbeat is fresh → disconnect
+      the user client (if running) and wait in a lightweight poll loop until
+      this node becomes the leader.  The bot client remains fully operational
+      so commands and alerts still work.
+    * If the leader record has expired → allow this node to start the user
+      client (failover recovery path).
+
+    This eliminates ``AuthKeyDuplicatedError`` caused by two nodes sharing
+    the same StringSession simultaneously.
     """
     logger = logging.getLogger(__name__)
     retry_count = 0
     max_retries_before_alert = 5
+    # How often (seconds) to re-check leader status while in standby-wait.
+    LEADER_POLL_INTERVAL = 15
 
     while True:
+        # ── Leader guard ─────────────────────────────────────────────────
+        try:
+            allowed, reason = await is_this_node_the_session_leader()
+        except Exception as guard_exc:
+            logger.warning("[UserClient-Guard] Leader check raised: %s — allowing.", guard_exc)
+            allowed, reason = True, f"guard-exception: {guard_exc}"
+
+        if not allowed:
+            # Disconnect the user client if it is currently connected so we
+            # don't hold an active session while another node also holds one.
+            user = user_client_ref_getter()
+            if user is not None and user.is_connected():
+                logger.warning(
+                    "[UserClient-Guard] Leadership transferred to another node (%s). "
+                    "Disconnecting user client on this node to prevent session conflict.",
+                    reason,
+                )
+                try:
+                    await user.disconnect()
+                except Exception as disc_exc:
+                    logger.warning("[UserClient-Guard] Disconnect noisy: %s", disc_exc)
+                USER_CLIENT_STATUS["connected"]  = False
+                USER_CLIENT_STATUS["last_error"] = f"Standby node — {reason}"
+
+            logger.info(
+                "[UserClient-Guard] Standby node. Polling every %ss for leader change. (%s)",
+                LEADER_POLL_INTERVAL, reason,
+            )
+            await asyncio.sleep(LEADER_POLL_INTERVAL)
+            continue
+        # ── End leader guard ─────────────────────────────────────────────
+
         try:
             user = user_client_ref_getter()
             if user is None:

@@ -5,3 +5,4 @@ apscheduler
 python-dotenv
 flask
 httpx
+psutil

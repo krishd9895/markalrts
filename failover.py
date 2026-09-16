@@ -85,6 +85,39 @@ HOSTNAME = resolve_host_pc_name()
 OS_INFO = f"{platform.system()} {platform.release()}"
 PYTHON_VERSION = platform.python_version()
 
+# ---------------------------------------------------------------------------
+# LEADER IP ADDRESS RESOLUTION
+# Stores the outbound IP that Telegram will see so session.py can compare
+# it against the currently-active leader's IP and refuse to start a second
+# Telethon user client from a non-leader node.
+# ---------------------------------------------------------------------------
+def resolve_node_ip() -> str:
+    """
+    Best-effort outbound IP (the IP this machine uses to reach the internet /
+    MongoDB).  Falls back to '127.0.0.1' rather than crashing.
+    """
+    # 1. Explicit override via .env — useful in NAT / VPN / Docker environments.
+    explicit_ip = os.getenv("NODE_IP", "").strip()
+    if explicit_ip:
+        return explicit_ip
+    # 2. UDP trick: open a socket toward a public address without actually
+    #    sending any data — the OS chooses the outbound interface.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(2)
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        pass
+    # 3. Hostname-based fallback.
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except Exception:
+        return "127.0.0.1"
+
+NODE_IP = resolve_node_ip()
+
+
 PROJECT_PATH = os.path.dirname(os.path.abspath(__file__))
 
 SYSTEM_HOME = os.path.expanduser("~")
@@ -554,6 +587,7 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
                     "current_leader.node_alias": NODE_ALIAS,
                     "current_leader.status": "active",
                     "current_leader.hostname": HOSTNAME,
+                    "current_leader.node_ip": NODE_IP,
                     "current_leader.os": OS_INFO,
                     "current_leader.python_version": PYTHON_VERSION,
                     "current_leader.heartbeat_count": heartbeat_counter,
@@ -586,6 +620,7 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
                 logger.info(f"🎉 [TAKEOVER COMPLETE!] Took over as leader at {takeover_time}")
                 logger.info(f"📋 [TAKEOVER DETAILS]:")
                 logger.info(f"   • Previous leader: {previous_leader_alias if previous_leader_alias else 'No previous leader'}")
+                logger.info(f"   • This node IP: {NODE_IP}")
                 logger.info("   • Reason: This node is the configured forced leader")
 
             db_disconnect_tracker = None
@@ -690,6 +725,7 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
                     "current_leader.node_alias": NODE_ALIAS,
                     "current_leader.status": "active",
                     "current_leader.hostname": HOSTNAME,
+                    "current_leader.node_ip": NODE_IP,
                     "current_leader.os": OS_INFO,
                     "current_leader.python_version": PYTHON_VERSION,
                     "current_leader.heartbeat_count": heartbeat_counter,
@@ -722,6 +758,7 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
                 logger.info(f"🎉 [TAKEOVER COMPLETE!] Took over as leader at {takeover_time}")
                 logger.info("📋 [TAKEOVER DETAILS]:")
                 logger.info(f"   • Previous leader: {previous_leader_alias if previous_leader_alias else 'No previous leader'}")
+                logger.info(f"   • This node IP: {NODE_IP}")
                 logger.info(f"   • Reason: {takeover_reason}")
 
             db_disconnect_tracker = None
@@ -840,10 +877,32 @@ def main():
 
                     logger.info(f"[BOT STATUS] Starting bot process with: {final_exec_args}")
                     try:
+                        # Build the child's environment: inherit everything from
+                        # the current process and inject HA node identity so
+                        # session.py can enforce the single-session-per-leader rule
+                        # WITHOUT importing failover.py (which would re-run the
+                        # entire watchdog setup inside the child process).
+                        child_env = os.environ.copy()
+                        child_env["FAILOVER_NODE_ID"]      = NODE_ID
+                        child_env["FAILOVER_NODE_ALIAS"]   = NODE_ALIAS
+                        child_env["FAILOVER_NODE_IP"]      = NODE_IP
+                        child_env["FAILOVER_SERVICE_ID"]   = SERVICE_ID
+                        child_env["FAILOVER_DB_NAME"]      = DATABASE_NAME
+                        child_env["FAILOVER_COLLECTION"]   = COLLECTION_NAME
+                        child_env["FAILOVER_HB_TIMEOUT"]   = str(HEARTBEAT_TIMEOUT)
+
                         if IS_WINDOWS:
-                            child_process = subprocess.Popen(final_exec_args, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                            child_process = subprocess.Popen(
+                                final_exec_args,
+                                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                                env=child_env,
+                            )
                         else:
-                            child_process = subprocess.Popen(final_exec_args, start_new_session=True)
+                            child_process = subprocess.Popen(
+                                final_exec_args,
+                                start_new_session=True,
+                                env=child_env,
+                            )
 
                         time.sleep(STARTUP_GRACE_PERIOD)
 

@@ -764,6 +764,7 @@ async def help_command(event):
         "/scan_old_messages (or /som) - Scan last 24h of monitored channels for missed messages\n"
         "/generate_session - Generate a new Telegram user session via phone + OTP\n"
         "/logs - Send today's activity and channel logs\n"
+        "/stats - Show runtime stats for this node (IP, CPU, memory, uptime, session)\n"
         "/help - Show this command list\n\n"
         "**Settings Menu Features:**\n"
         "• View/Add/Remove Portfolio Stocks\n"
@@ -779,6 +780,165 @@ async def help_command(event):
         "Columns: stock_name, positive_variants (comma-separated), exclusion_variants (comma-separated)\n"
     )
     await event.respond(help_text, link_preview=False)
+
+
+# =====================================================================
+# /stats — runtime node stats for owners
+# =====================================================================
+
+@bot.on(events.NewMessage(pattern="/stats"))
+async def stats_command_handler(event: events.NewMessage.Event):
+    if not is_authorized(event.sender_id):
+        return
+
+    import platform
+    import socket
+    import time as _time
+
+    # ── IP addresses ────────────────────────────────────────────────
+    # Outbound IP (what external services like Telegram see)
+    def _outbound_ip() -> str:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(2)
+                s.connect(("8.8.8.8", 80))
+                return s.getsockname()[0]
+        except Exception:
+            return "unavailable"
+
+    # All local IPs bound to this machine
+    def _local_ips() -> list[str]:
+        try:
+            hostname = socket.gethostname()
+            return list({addr[4][0] for addr in socket.getaddrinfo(hostname, None)
+                         if addr[0] in (socket.AF_INET, socket.AF_INET6)
+                         and not addr[4][0].startswith("127.")
+                         and addr[4][0] != "::1"}) or ["127.0.0.1"]
+        except Exception:
+            return ["unavailable"]
+
+    outbound_ip = _outbound_ip()
+    local_ips   = ", ".join(_local_ips())
+
+    # ── Failover / HA identity (injected by failover.py as env vars) ──
+    failover_node_id    = os.getenv("FAILOVER_NODE_ID", "")
+    failover_node_alias = os.getenv("FAILOVER_NODE_ALIAS", "")
+    failover_node_ip    = os.getenv("FAILOVER_NODE_IP", "")
+    failover_service_id = os.getenv("FAILOVER_SERVICE_ID", "")
+    is_under_failover   = bool(failover_node_id)
+
+    # ── CPU & memory (psutil — optional) ───────────────────────────
+    cpu_line = "psutil not installed"
+    mem_line = "psutil not installed"
+    disk_line = "psutil not installed"
+    boot_time_str = "unavailable"
+    try:
+        import psutil
+        cpu_line  = f"{psutil.cpu_percent(interval=0.5):.1f}%  ({psutil.cpu_count()} logical cores)"
+        vm        = psutil.virtual_memory()
+        mem_line  = (
+            f"{vm.percent:.1f}% used  "
+            f"({vm.used / 1024**3:.1f} GB / {vm.total / 1024**3:.1f} GB)"
+        )
+        du        = psutil.disk_usage(os.path.abspath("."))
+        disk_line = (
+            f"{du.percent:.1f}% used  "
+            f"({du.used / 1024**3:.1f} GB / {du.total / 1024**3:.1f} GB)"
+        )
+        boot_dt   = datetime.fromtimestamp(psutil.boot_time(), IST)
+        boot_time_str = boot_dt.strftime("%Y-%m-%d %H:%M:%S IST")
+    except ImportError:
+        pass
+    except Exception as psu_exc:
+        cpu_line = mem_line = disk_line = f"error: {psu_exc}"
+
+    # ── Process uptime ──────────────────────────────────────────────
+    try:
+        import psutil
+        proc     = psutil.Process(os.getpid())
+        proc_start = datetime.fromtimestamp(proc.create_time(), IST)
+        uptime_s   = int((_time.time() - proc.create_time()))
+        h, rem     = divmod(uptime_s, 3600)
+        m, s       = divmod(rem, 60)
+        uptime_str = f"{h}h {m}m {s}s  (since {proc_start.strftime('%Y-%m-%d %H:%M:%S IST')})"
+    except Exception:
+        uptime_str = "unavailable"
+
+    # ── Python & OS ─────────────────────────────────────────────────
+    py_version = platform.python_version()
+    os_info    = f"{platform.system()} {platform.release()} ({platform.machine()})"
+    hostname   = platform.node()
+    pid        = os.getpid()
+
+    # ── Telethon user client status ─────────────────────────────────
+    uc_connected = USER_CLIENT_STATUS.get("connected", False)
+    uc_failures  = USER_CLIENT_STATUS.get("consecutive_failures", 0)
+    uc_last_err  = USER_CLIENT_STATUS.get("last_error") or "none"
+    uc_icon      = "🟢" if uc_connected else "🔴"
+    uc_status    = "connected" if uc_connected else f"disconnected ({clean_text_for_telegram(uc_last_err, 120)})"
+
+    # ── MongoDB latency ─────────────────────────────────────────────
+    mongo_ping_ms = "unavailable"
+    try:
+        t0 = _time.monotonic()
+        await db.command("ping")
+        mongo_ping_ms = f"{((_time.monotonic() - t0) * 1000):.1f} ms"
+    except Exception as ping_exc:
+        mongo_ping_ms = f"error: {ping_exc}"
+
+    # ── Current IST time ────────────────────────────────────────────
+    now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+
+    # ── Build message ───────────────────────────────────────────────
+    lines = [
+        "📊 **Node Runtime Stats**",
+        f"`{now_ist}`",
+        "",
+        "**🌐 Network**",
+        f"  Outbound IP (Telegram sees) : `{outbound_ip}`",
+        f"  Local IPs                   : `{local_ips}`",
+        f"  Hostname                    : `{hostname}`",
+    ]
+
+    if is_under_failover:
+        lines += [
+            "",
+            "**🔁 HA Failover**",
+            f"  Service ID  : `{failover_service_id}`",
+            f"  Node alias  : `{failover_node_alias}`",
+            f"  Node IP     : `{failover_node_ip}`",
+            f"  Node ID     : `{failover_node_id[:24]}…`",
+        ]
+    else:
+        lines += [
+            "",
+            "**🔁 HA Failover** : not active (single-node mode)",
+        ]
+
+    lines += [
+        "",
+        "**🖥️ System**",
+        f"  OS          : `{os_info}`",
+        f"  Python      : `{py_version}`",
+        f"  PID         : `{pid}`",
+        f"  Boot time   : `{boot_time_str}`",
+        f"  Uptime      : `{uptime_str}`",
+        "",
+        "**⚙️ Resources**",
+        f"  CPU         : `{cpu_line}`",
+        f"  Memory      : `{mem_line}`",
+        f"  Disk (cwd)  : `{disk_line}`",
+        "",
+        "**🗄️ MongoDB**",
+        f"  Ping        : `{mongo_ping_ms}`",
+        "",
+        "**📡 User Client (Telethon)**",
+        f"  Status      : {uc_icon} `{uc_status}`",
+        f"  Failures    : `{uc_failures}`",
+    ]
+
+    await event.respond("\n".join(lines), link_preview=False)
+
 
 @bot.on(events.NewMessage(pattern="/logs"))
 async def logs_command_handler(event: events.NewMessage.Event):
